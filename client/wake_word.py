@@ -3,6 +3,9 @@ import struct
 import pyaudio
 import logging
 import asyncio
+import json
+import time
+import websockets
 import pvporcupine
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +35,8 @@ class WakeWordDetector:
         self.pa: Optional[pyaudio.PyAudio] = None
         self.audio_stream = None
         self.is_listening = False
+        self.is_streaming = False
+        self.audio_queue: Optional[asyncio.Queue] = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="WakeWordThread")
         self._loop = None
 
@@ -59,16 +64,22 @@ class WakeWordDetector:
             
             while self.is_listening:
                 # Read audio frame (exception_on_overflow=False prevents crashes on slow systems like VM/Docker)
-                pcm = self.audio_stream.read(self.porcupine.frame_length, exception_on_overflow=False)
-                pcm = struct.unpack_from("h" * self.porcupine.frame_length, pcm)
+                pcm_bytes = self.audio_stream.read(self.porcupine.frame_length, exception_on_overflow=False)
+                pcm_unpacked = struct.unpack_from("h" * self.porcupine.frame_length, pcm_bytes)
                 
-                keyword_index = self.porcupine.process(pcm)
+                keyword_index = self.porcupine.process(pcm_unpacked)
                 
                 if keyword_index >= 0:
                     logging.info("Wake word detected!")
                     # Securely schedule the callback on the main asyncio event loop
                     if self._loop and not self._loop.is_closed():
                         self._loop.call_soon_threadsafe(self.callback)
+                
+                # If streaming is active, push raw audio chunks to the queue
+                if self.is_streaming and self.audio_queue is not None:
+                    if self._loop and not self._loop.is_closed():
+                        # Send raw bytes for the WebSocket stream
+                        self._loop.call_soon_threadsafe(self.audio_queue.put_nowait, pcm_bytes)
                     
         except Exception as e:
             logging.error(f"Error in wake word detection: {e}")
@@ -117,24 +128,51 @@ class WakeWordDetector:
 # Usage Example / Testing Script
 # ==============================================================================
 
-def on_wake_word():
-    """Callback function executed on the main event loop."""
-    print("\n" + "="*50)
-    print(" >>> 'Sai' Wake Word Triggered! Initiate system processing...")
-    print("="*50 + "\n")
-    # Example: you would set an asyncio.Event, push to an asyncio.Queue, 
-    # or start recording audio for STT here to pass to the websocket.
-
-async def mock_cloud_backend_websocket():
-    """Mock task representing the asynchronous websocket connection."""
-    task_id = 0
+async def stream_audio_to_websocket(detector: WakeWordDetector):
+    """
+    Connects to the server, sends a handshake, and streams audio chunks from the detector's queue.
+    """
+    uri = "ws://localhost:8080/ws/agent"
+    detector.audio_queue = asyncio.Queue()
+    detector.is_streaming = True
+    
     try:
-        while True:
-            logging.info(f"[Main Thread] WebSocket pinging cloud backend... (task {task_id})")
-            task_id += 1
-            await asyncio.sleep(5)
-    except asyncio.CancelledError:
-        logging.info("[Main Thread] WebSocket connection closed.")
+        logging.info(f"Connecting to WebSocket at {uri}...")
+        async with websockets.connect(uri) as websocket:
+            # Handshake
+            handshake = {
+                "event": "wake_word_detected",
+                "timestamp": time.time()
+            }
+            await websocket.send(json.dumps(handshake))
+            logging.info("Handshake sent. Now streaming audio...")
+            
+            while detector.is_streaming:
+                try:
+                    # Wait for audio data from the detector loop
+                    chunk = await asyncio.wait_for(detector.audio_queue.get(), timeout=1.0)
+                    await websocket.send(chunk)
+                except asyncio.TimeoutError:
+                    continue
+                except websockets.ConnectionClosed:
+                    logging.warning("WebSocket connection closed by server.")
+                    break
+                    
+    except Exception as e:
+        logging.error(f"WebSocket error: {e}")
+    finally:
+        logging.info("Closing WebSocket stream and returning to wake word detection.")
+        detector.is_streaming = False
+        detector.audio_queue = None
+
+def on_wake_word(detector: WakeWordDetector):
+    """Callback triggered when the wake word is detected."""
+    print("\n" + "="*50)
+    print(" >>> 'Sai' Wake Word Triggered! Starting audio stream...")
+    print("="*50 + "\n")
+    
+    # Start the streaming task on the event loop
+    asyncio.create_task(stream_audio_to_websocket(detector))
 
 async def main():
     # Load environment variables from .env file
@@ -161,17 +199,15 @@ async def main():
         return
 
     # 3. Instantiate and start detector
+    # We pass the detector instance to the callback using a lambda 
     detector = WakeWordDetector(
         keyword_path=keyword_path,
         access_key=access_key,
-        callback=on_wake_word
+        callback=lambda: on_wake_word(detector)
     )
     
     # Start the detector (runs the PyAudio loop in a separate thread)
     detector.start()
-    
-    # 4. Start concurrent asyncio tasks (e.g. WebSocket connection)
-    ws_task = asyncio.create_task(mock_cloud_backend_websocket())
     
     logging.info("System is ready. Press Ctrl+C to terminate.")
     
@@ -184,7 +220,6 @@ async def main():
     finally:
         # Graceful shutdown Sequence
         logging.info("Initiating graceful shutdown...")
-        ws_task.cancel()
         detector.stop()
         
         # Allow time for threads to shut down and resources to be released

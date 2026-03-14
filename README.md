@@ -91,16 +91,17 @@ gcloud run deploy sai-orchestrator \
 
 ### 2. Local Client Execution
 
-Once the cloud backend is live, run the local eyes and hands:
+Once the cloud backend is live, run the local eyes and ears (wake word detection and audio streaming):
 
 ```bash
-cd ../local-client
+cd client
 pip install -r requirements.txt
 
-# Start the local agent and connect to your Google Cloud Run WebSocket URL
-python main.py --ws-url wss://sai-orchestrator-[hash]-uc.a.run.app
-
+# Start the wake word detector and audio streamer
+python wake_word.py
 ```
+
+*Note: The script expects a `.env` file with your `PICOVOICE_ACCESS_KEY` and the `HeySai_mac.ppn` model file in the `client/` directory.*
 
 ---
 

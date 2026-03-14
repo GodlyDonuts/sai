@@ -9,6 +9,7 @@ The system is designed with an asynchronous, non-blocking architecture to ensure
 - **Wake Word Engine**: `pvporcupine` processes the audio stream to detect the custom wake word `HeySai_mac.ppn`.
 - **Concurrency**: The blocking audio read loop is executed in a background daemon thread using `ThreadPoolExecutor`.
 - **Event Loop Integration**: When the wake word is detected, Porcupine triggers a callback that is safely dispatched back to the main `asyncio` event loop using `call_soon_threadsafe`.
+- **Audio Streaming**: Once triggered, the client establishes a WebSocket connection to the backend and streams raw binary audio chunks via an `asyncio.Queue`.
 
 ## Prerequisites
 - macOS (as the `.ppn` model is compiled specifically for Mac)
@@ -28,7 +29,7 @@ Install the required packages from `requirements.txt`:
 ```bash
 pip install -r requirements.txt
 ```
-*(Dependencies: `pvporcupine`, `pyaudio`, `python-dotenv`)*
+*(Dependencies: `pvporcupine`, `pyaudio`, `python-dotenv`, `websockets`)*
 
 ### 3. Environment Variables
 The application uses `python-dotenv` to load the Picovoice Access Key. 
@@ -44,8 +45,13 @@ The script requires a custom `.ppn` file trained for the wake word "Sai" on Mac.
 - The script dynamically resolves the absolute path to `HeySai_mac.ppn` using `__file__`, meaning `python wake_word.py` can be executed successfully from any working directory.
 
 ## Running the Application
-To run the wake word detector:
+To run the wake word detector and start streaming audio to the backend:
 ```bash
 python client/wake_word.py
 ```
-You will see mocked "WebSocket pinging" logs every 5 seconds. This demonstrates that the main asynchronous loop is alive and non-blocked while the microphone actively listens in the background. Saying "Sai" will print an interception log.
+### What happens:
+1. **Idle Mode**: The script listens quietly for the wake word.
+2. **Trigger**: Saying "Sai" triggers the `on_wake_word` callback.
+3. **WebSocket Handshake**: The client connects to `ws://localhost:8080/ws/agent` and sends a JSON handshake: `{"event": "wake_word_detected", "timestamp": <unix_timestamp>}`.
+4. **Binary Streaming**: The client begins streaming raw binary audio chunks continuously to the server.
+5. **Graceful Recovery**: If the server disconnects, the client resets and returns to idle listening mode.
