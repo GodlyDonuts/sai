@@ -7,6 +7,11 @@ import json
 import time
 import websockets
 import pvporcupine
+import functools
+import base64
+import mss
+import mss.tools
+import pyautogui
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
@@ -128,50 +133,139 @@ class WakeWordDetector:
 # Usage Example / Testing Script
 # ==============================================================================
 
+def capture_screen_sync() -> dict:
+    """Captures the primary screen using mss, compresses to PNG, and returns base64 and dimensions."""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]  # Primary monitor
+        sct_img = sct.grab(monitor)
+        # Compress to PNG
+        png_bytes = mss.tools.to_png(sct_img.rgb, sct_img.size)
+        return {
+            "image_base64": base64.b64encode(png_bytes).decode('utf-8'),
+            "width": sct_img.size.width,
+            "height": sct_img.size.height
+        }
+
+def perform_click_sync(x: int, y: int):
+    """Performs a physical mouse click at the specified coordinates."""
+    pyautogui.click(x, y)
+
+async def receive_audio_from_websocket(websocket, output_stream):
+    """
+    Listens for binary audio data from the WebSocket and writes it to the PyAudio output stream.
+    Also handles text (JSON) commands for OS control.
+    """
+    try:
+        logging.info("Started audio reception worker.")
+        loop = asyncio.get_running_loop()
+        async for message in websocket:
+            if isinstance(message, bytes):
+                # Write binary PCM data directly to the output stream without blocking
+                await loop.run_in_executor(
+                    None, 
+                    functools.partial(output_stream.write, message, exception_on_underflow=False)
+                )
+            else:
+                try:
+                    data = json.loads(message)
+                    logging.info(f"Received JSON message: {data}")
+                    
+                    command = data.get("command")
+                    if command == "capture_screen":
+                        # Execute screen capture in a background thread to prevent blocking
+                        capture_data = await loop.run_in_executor(None, capture_screen_sync)
+                        response = {
+                            "event": "screen_captured",
+                            "image_base64": capture_data["image_base64"],
+                            "width": capture_data["width"],
+                            "height": capture_data["height"]
+                        }
+                        await websocket.send(json.dumps(response))
+                        logging.info(f"Sent screen capture ({capture_data['width']}x{capture_data['height']}).")
+                        
+                    elif command == "click":
+                        x = data.get("x")
+                        y = data.get("y")
+                        if x is not None and y is not None:
+                            await loop.run_in_executor(None, perform_click_sync, x, y)
+                            logging.info(f"Performed click at ({x}, {y})")
+                        else:
+                            logging.warning(f"Click command missing x or y coordinates: {data}")
+
+                except json.JSONDecodeError:
+                    logging.warning(f"Received unknown message type: {message}")
+    except websockets.ConnectionClosed:
+        logging.warning("Output: WebSocket connection closed.")
+    except Exception as e:
+        logging.error(f"Error receiving audio: {e}")
+
 async def stream_audio_to_websocket(detector: WakeWordDetector):
     """
-    Connects to the server, sends a handshake, and streams audio chunks from the detector's queue.
+    Connects to the server, sends a handshake, and manages concurrent audio 
+    streaming (mic to cloud) and playback (cloud to local speakers).
     """
     uri = "ws://localhost:8080/ws/agent"
     detector.audio_queue = asyncio.Queue()
     detector.is_streaming = True
     
+    # Initialize PyAudio for output (Playback)
+    pa_output = pyaudio.PyAudio()
+    output_stream = pa_output.open(
+        rate=16000,
+        channels=1,
+        format=pyaudio.paInt16,
+        output=True,
+        frames_per_buffer=1024 # Small buffer for low latency
+    )
+
+    async def _send_audio(ws):
+        logging.info("Handshake sent. Now streaming upstream audio...")
+        while detector.is_streaming:
+            try:
+                # Wait for audio data from the detector loop
+                chunk = await asyncio.wait_for(detector.audio_queue.get(), timeout=1.0)
+                await ws.send(chunk)
+            except asyncio.TimeoutError:
+                continue
+            except websockets.ConnectionClosed:
+                break
+
     try:
         logging.info(f"Connecting to WebSocket at {uri}...")
         async with websockets.connect(uri) as websocket:
-            # Handshake
+            # Step 1: Handshake
             handshake = {
                 "event": "wake_word_detected",
                 "timestamp": time.time()
             }
             await websocket.send(json.dumps(handshake))
-            logging.info("Handshake sent. Now streaming audio...")
             
-            while detector.is_streaming:
-                try:
-                    # Wait for audio data from the detector loop
-                    chunk = await asyncio.wait_for(detector.audio_queue.get(), timeout=1.0)
-                    await websocket.send(chunk)
-                except asyncio.TimeoutError:
-                    continue
-                except websockets.ConnectionClosed:
-                    logging.warning("WebSocket connection closed by server.")
-                    break
+            # Step 2: Run upstream and downstream concurrently
+            await asyncio.gather(
+                _send_audio(websocket),
+                receive_audio_from_websocket(websocket, output_stream)
+            )
                     
     except Exception as e:
-        logging.error(f"WebSocket error: {e}")
+        logging.error(f"WebSocket session error: {e}")
     finally:
-        logging.info("Closing WebSocket stream and returning to wake word detection.")
+        logging.info("Cleaning up WebSocket and playback resources...")
         detector.is_streaming = False
         detector.audio_queue = None
+        
+        # Cleanup Playback
+        if output_stream:
+            output_stream.stop_stream()
+            output_stream.close()
+        pa_output.terminate()
 
 def on_wake_word(detector: WakeWordDetector):
     """Callback triggered when the wake word is detected."""
     print("\n" + "="*50)
-    print(" >>> 'Sai' Wake Word Triggered! Starting audio stream...")
+    print(" >>> 'Sai' Wake Word Triggered! Starting bidirectional session...")
     print("="*50 + "\n")
     
-    # Start the streaming task on the event loop
+    # Start the bidirectional streaming/playback task on the event loop
     asyncio.create_task(stream_audio_to_websocket(detector))
 
 async def main():

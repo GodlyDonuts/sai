@@ -3,3 +3,5 @@ pyaudio
 pvporcupine
 python-dotenv
 websockets>=1.0.0
+mss
+pyautogui

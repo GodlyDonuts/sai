@@ -17,6 +17,7 @@ logger = logging.getLogger("sai-server")
 
 app = FastAPI(title="Sai OS Agent Cloud Backend")
 
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_WS_URL = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key={GEMINI_API_KEY}"
 
@@ -62,13 +63,41 @@ async def websocket_endpoint(websocket: WebSocket):
             # Send Setup Message
             setup_msg = {
                 "setup": {
-                    "model": "models/gemini-2.5-flash-tts",
+                    "model": "models/gemini-2.5-flash-native-audio-latest",
                     "systemInstruction": {
                         "role": "system",
                         "parts": [{
-                            "text": "You are Sai, a voice-native cybernetic co-pilot. You control the user's operating system. Keep responses incredibly concise, conversational, and action-oriented."
+                            "text": "You are Sai, an ultra-fast, voice-native cybernetic OS co-pilot. You do not just chat; you physically control the user's computer via tools. \n\nCRITICAL EXECUTION LOOP:\n1. If the user asks you to interact with the screen (e.g., 'click the login button', 'play that video'), you MUST immediately call the `request_screen_capture` tool.\n2. Once you receive the screen capture image, visually scan it to locate the requested UI element.\n3. Calculate the exact [X, Y] pixel coordinates for the absolute center of that UI element.\n4. Call the `execute_click(x, y)` tool using those precise coordinates.\n\nRULES:\n- Be incredibly concise. Speak in short, conversational affirmations like 'Got it', 'Clicking now', or 'On it'. Do not explain your visual reasoning out loud.\n- If a UI is ambiguous, ask the user for clarification (e.g., 'There are two submit buttons, which one?').\n- Your primary directive is zero-click web navigation. Act definitively."
                         }]
                     },
+                    "tools": [
+                        {
+                            "functionDeclarations": [
+                                {
+                                    "name": "request_screen_capture",
+                                    "description": "Call this to see the user's current screen to locate UI elements."
+                                },
+                                {
+                                    "name": "execute_click",
+                                    "description": "Call this to physically click the mouse at specific coordinates on the screen.",
+                                    "parameters": {
+                                        "type": "OBJECT",
+                                        "properties": {
+                                            "x": {
+                                                "type": "INTEGER",
+                                                "description": "The X coordinate to click."
+                                            },
+                                            "y": {
+                                                "type": "INTEGER",
+                                                "description": "The Y coordinate to click."
+                                            }
+                                        },
+                                        "required": ["x", "y"]
+                                    }
+                                }
+                            ]
+                        }
+                    ],
                     "generationConfig": {
                         "responseModalities": ["audio"],
                         "speechConfig": {
@@ -92,17 +121,50 @@ async def websocket_endpoint(websocket: WebSocket):
                 """Client -> Google"""
                 try:
                     while True:
-                        audio_chunk = await websocket.receive_bytes()
-                        # Wrap in realtimeInput JSON structure
-                        payload = {
-                            "realtimeInput": {
-                                "mediaChunks": [{
-                                    "data": base64.b64encode(audio_chunk).decode("utf-8"),
-                                    "mimeType": "audio/pcm;rate=16000"
-                                }]
+                        message = await websocket.receive()
+                        if "bytes" in message:
+                            # Audio bytes
+                            audio_chunk = message["bytes"]
+                            payload = {
+                                "realtimeInput": {
+                                    "mediaChunks": [{
+                                        "data": base64.b64encode(audio_chunk).decode("utf-8"),
+                                        "mimeType": "audio/pcm;rate=16000"
+                                    }]
+                                }
                             }
-                        }
-                        await google_ws.send(json.dumps(payload))
+                            await google_ws.send(json.dumps(payload))
+                        elif "text" in message:
+                            # Text JSON from client (e.g. screen capture response)
+                            try:
+                                data = json.loads(message["text"])
+                                if data.get("event") == "screen_captured":
+                                    image_b64 = data.get("image_base64")
+                                    width = data.get("width", 1920)
+                                    height = data.get("height", 1080)
+                                    logger.info(f"Received screen capture from client ({width}x{height}). Forwarding to Gemini.")
+                                    # Forward as FunctionResponse
+                                    function_response_payload = {
+                                        "clientContent": {
+                                            "turns": [{
+                                                "role": "user",
+                                                "parts": [{
+                                                    "functionResponse": {
+                                                        "name": "request_screen_capture",
+                                                        "response": {
+                                                            "image_b64": image_b64,
+                                                            "message": f"Here is the screenshot. The resolution is {width}x{height}."
+                                                        }
+                                                    }
+                                                }]
+                                            }],
+                                            "turnComplete": True
+                                        }
+                                    }
+                                    await google_ws.send(json.dumps(function_response_payload))
+                            except json.JSONDecodeError:
+                                logger.error("Received malformed JSON text from client.")
+
                 except WebSocketDisconnect:
                     logger.info("Client disconnected (upstream)")
                 except Exception as e:
@@ -125,8 +187,47 @@ async def websocket_endpoint(websocket: WebSocket):
                                             audio_binary = base64.b64decode(audio_data_b64)
                                             await websocket.send_bytes(audio_binary)
                                             logger.info(f"Forwarded {len(audio_binary)} bytes of audio to client")
-                        
-                        # Optional: handle tool calls or other message types here
+                                    elif "functionCall" in part:
+                                        function_call = part["functionCall"]
+                                        fname = function_call.get("name")
+                                        args = function_call.get("args", {})
+                                        call_id = function_call.get("id")
+                                        
+                                        logger.info(f"Received function call from Gemini: {fname}")
+                                        
+                                        if fname == "request_screen_capture":
+                                            # Instruct local client to capture screen
+                                            await websocket.send_text(json.dumps({"command": "capture_screen"}))
+                                            # Note: We don't send a functionResponse immediately. Wait for the client to reply in `upstream`.
+                                            
+                                        elif fname == "execute_click":
+                                            # Instruct local client to click
+                                            await websocket.send_text(json.dumps({
+                                                "command": "click", 
+                                                "x": args.get("x"), 
+                                                "y": args.get("y")
+                                            }))
+                                            
+                                            # Send immediate success functionResponse back to Gemini
+                                            function_response_payload = {
+                                                "clientContent": {
+                                                    "turns": [{
+                                                        "role": "user",
+                                                        "parts": [{
+                                                            "functionResponse": {
+                                                                "name": "execute_click",
+                                                                "response": {
+                                                                    "status": "success",
+                                                                    "message": f"Clicked at coordinates ({args.get('x')}, {args.get('y')})"
+                                                                }
+                                                            }
+                                                        }]
+                                                    }],
+                                                    "turnComplete": True
+                                                }
+                                            }
+                                            await google_ws.send(json.dumps(function_response_payload))
+                                            logger.info("Acknowleged execute_click back to Gemini.")
 
                 except Exception as e:
                     logger.error(f"Error in downstream: {e}")
