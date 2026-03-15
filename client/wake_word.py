@@ -150,25 +150,58 @@ def perform_click_sync(x: int, y: int):
     """Performs a physical mouse click at the specified coordinates."""
     pyautogui.click(x, y)
 
+def perform_type_sync(text: str):
+    """Presses Cmd+Space to open Spotlight, clears it, types, and launches."""
+    # Use explicit keyDown/Up for better reliability on macOS
+    pyautogui.keyDown('command')
+    time.sleep(0.1)
+    pyautogui.press('space')
+    time.sleep(0.1)
+    pyautogui.keyUp('command')
+    time.sleep(1.0)  # Wait for Spotlight to fully focus
+    # Clear any existing text in Spotlight
+    pyautogui.hotkey('command', 'a')
+    pyautogui.press('backspace')
+    time.sleep(0.1)
+    # Type exactly the text provided
+    pyautogui.write(text, interval=0.04)
+    time.sleep(0.5)  # Wait for search results
+    pyautogui.press('enter')
+    time.sleep(0.2)
+    pyautogui.press('enter')  # Redundant enter to be sure
+
 async def receive_audio_from_websocket(websocket, output_stream):
     """
     Listens for binary audio data from the WebSocket and writes it to the PyAudio output stream.
     Also handles text (JSON) commands for OS control.
     """
+    downstream_audio_queue = asyncio.Queue()
+    
     try:
         logging.info("Started audio reception worker.")
         loop = asyncio.get_running_loop()
-        async for message in websocket:
-            if isinstance(message, bytes):
-                # Write binary PCM data directly to the output stream without blocking
+        
+        async def audio_player():
+            while True:
+                chunk = await downstream_audio_queue.get()
+                if chunk is None:
+                    break # exit signal
                 await loop.run_in_executor(
                     None, 
-                    functools.partial(output_stream.write, message, exception_on_underflow=False)
+                    functools.partial(output_stream.write, chunk, exception_on_underflow=False)
                 )
+                
+        player_task = asyncio.create_task(audio_player())
+        
+        async for message in websocket:
+            if isinstance(message, bytes):
+                # Route binary PCM data to the queue so we do not block the websocket receiving thread!
+                # logging.debug(f"Received {len(message)} bytes of audio")
+                await downstream_audio_queue.put(message)
             else:
                 try:
                     data = json.loads(message)
-                    logging.info(f"Received JSON message: {data}")
+                    logging.info(f"SERVER COMMAND RECEIVED: {json.dumps(data, indent=2)}")
                     
                     command = data.get("command")
                     if command == "capture_screen":
@@ -187,10 +220,15 @@ async def receive_audio_from_websocket(websocket, output_stream):
                         x = data.get("x")
                         y = data.get("y")
                         if x is not None and y is not None:
-                            await loop.run_in_executor(None, perform_click_sync, x, y)
+                            await loop.run_in_executor(None, perform_click_sync, int(x), int(y))
                             logging.info(f"Performed click at ({x}, {y})")
                         else:
                             logging.warning(f"Click command missing x or y coordinates: {data}")
+                            
+                    elif command == "type_text":
+                        text = data.get("text", "")
+                        await loop.run_in_executor(None, perform_type_sync, text)
+                        logging.info(f"Typed text via Spotlight: {text}")
 
                 except json.JSONDecodeError:
                     logging.warning(f"Received unknown message type: {message}")
@@ -198,6 +236,10 @@ async def receive_audio_from_websocket(websocket, output_stream):
         logging.warning("Output: WebSocket connection closed.")
     except Exception as e:
         logging.error(f"Error receiving audio: {e}")
+    finally:
+        await downstream_audio_queue.put(None)
+        if 'player_task' in locals():
+            await player_task
 
 async def stream_audio_to_websocket(detector: WakeWordDetector):
     """
