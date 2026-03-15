@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 websockets
 python-dotenv
+openai
+Pillow

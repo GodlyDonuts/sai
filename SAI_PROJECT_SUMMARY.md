@@ -1,33 +1,68 @@
-# Sai OS Agent - Project Summary & Status
+# Sai OS Agent — Project Summary & Status
 
 ## Overview
-Sai is a voice-native OS co-pilot designed for Mac. It uses a **Hybrid Brain** architecture:
-- **Gemini 2.5 Flash Native Audio:** Handles the "Senses" (Voice input, Audio output, and Transcription).
-- **Cerebras (Qwen 3 / Llama 3.1):** Handles the "Cortex" (Logic, Decision making, and Tool generation).
-- **Python Client:** Executes physical Mac commands via `pyautogui` (Clicking, Typing, Spotlight).
+Sai is a voice-native OS co-pilot for macOS. It uses a **Hybrid Brain** architecture:
 
-## Current Status (March 15, 2026)
-We are currently facing an **Instant Disconnection** issue with the Gemini Live API. The connection to the Google WebSocket closes immediately after sending the `setup` payload.
+| Layer | Technology | Role |
+|---|---|---|
+| **Senses** | Gemini 2.5 Flash Native Audio (Google WebSocket) | Voice input, audio playback, real-time transcription |
+| **Routing Brain** | Nvidia Nemotron 3 Super 120B (OpenRouter, free) | Classifies command as SIMPLE or ADVANCED |
+| **Simple Brain** | Nvidia Nemotron 3 Super 120B (OpenRouter, free) | Extracts single tool call for app launches |
+| **Senior Brain** | Gemini 3 Flash Preview (OpenRouter) | Multi-step vision reasoning for complex tasks |
+| **Client Executor** | Python + PyAutoGUI + mss | Executes physical Mac actions |
 
-### The Problem
-- **Endpoint:** Using `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`.
-- **Symptom:** Disconnects after `setup`. No JSON error received.
-- **Hypothesis:** The `setup` JSON schema for Gemini 2.5 Native Audio might have changed or requires specific flags (like `inputAudioTranscription`) located differently in the payload.
+---
 
-### Current Implementation Flow:
-1. **User speaks** -> `wake_word.py` (Hey Sai) detected.
-2. **Audio streams** to `main.py` -> Proxied to **Gemini**.
-3. **Gemini Transcribes** -> Server receives text.
-4. **Server triggers Cerebras** -> Receives tool JSON.
-5. **Server sends JSON to Client** -> Client clicks/types.
-6. **Gemini speaks** -> "Got it, opening Safari."
+## Current Status (March 15, 2026) — ✅ Functional
 
-## Configuration Details
-- **Gemini Model:** `models/gemini-2.5-flash-native-audio-latest`
-- **Cerebras Model:** `qwen-3-235b-a22b-instruct-2507`
-- **Tool Logic:** Spotlight is used for app launching (Cmd+Space + typing + Enter).
+The full end-to-end pipeline is **working**. Wake word is detected, audio streams to the cloud, Gemini transcribes, and the brain issues real OS commands that execute on the Mac.
+
+### Architecture Flow
+1. **User says "Hey Sai..."** → `wake_word.py` detects wake word via Picovoice Porcupine
+2. **Screenshot auto-captured** → Sent to server and forwarded to Gemini for visual context
+3. **Audio streams** → `wake_word.py` → FastAPI WebSocket → Gemini Live API
+4. **Gemini transcribes** → Fragments are **buffered** with a 1.5s debounce before processing
+5. **Router classifies** → SIMPLE (Nemotron) or ADVANCED (multi-step agent loop)
+6. **SIMPLE path** → Single tool command extracted and sent to client immediately
+7. **ADVANCED path** → Multi-step agent loop (up to 10 steps):
+   - Screenshot is annotated with red coordinate grid (every 200px)
+   - Gemini 3 Flash reasons about the screenshot and outputs a command
+   - Command is executed on Mac, then a **fresh screenshot** is captured
+   - Loop continues until the model reports `"done": true`
+8. **Gemini speaks** → Audio streamed back to client for playback
+
+---
+
+## Configuration
+
+| Setting | Value |
+|---|---|
+| Wake Word Model | Picovoice Porcupine (`HeySai_mac.ppn`) |
+| Gemini Audio Model | `models/gemini-2.5-flash-native-audio-preview-12-2025` |
+| Routing / Simple Brain | `nvidia/nemotron-3-super-120b-a12b:free` |
+| Senior Brain (Vision) | `google/gemini-3-flash-preview` |
+| Client OS Control | `pyautogui` + `mss` (screenshot) + `pbcopy` (clipboard paste) |
+
+---
+
+## Supported Commands (Client)
+| Command | Description |
+|---|---|
+| `type_text` | Opens Spotlight, types app name, presses Enter |
+| `open_url` | Opens URL directly in default browser |
+| `click` | Clicks at `(x, y)` pixel coordinates |
+| `keyboard_type` | Pastes text via clipboard into focused element |
+| `capture_screen` | Captures and returns screenshot to server |
+
+---
+
+## Known Issues / Limitations
+
+- **Spotify search bar** — `keyboard_type` after `click` is inconsistent; Spotify may need a keyboard shortcut (`Cmd+L`) to reliably focus the search bar
+- **Transcription fragments** — Gemini sometimes fires `turnComplete` early, causing the 1.5s debounce to flush a partial sentence
+- **SIMPLE routing too aggressive** — Some commands that need vision (e.g. "create a new document") are routed as SIMPLE and produce hallucinated commands
 
 ## Next Steps
-- Solve the Bidi WebSocket handshake for the Native Audio model.
-- Enable `inputAudioTranscription` correctly.
-- Debug the client-side audio playback (user currently cannot hear model).
+- Improve routing accuracy by giving Nemotron more examples and a broader ADVANCED category
+- Add `press_key` command (for `Enter`, `Escape`, arrow keys, `Cmd+L` etc.) to the client
+- Add memory / context persistence so Sai remembers previous actions within a session

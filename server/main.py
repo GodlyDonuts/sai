@@ -3,12 +3,14 @@ import json
 import base64
 import asyncio
 import os
+import io
 import collections
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from datetime import datetime
 import websockets
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from PIL import Image, ImageDraw, ImageFont
 
 # Load environment variables from .env file
 load_dotenv()
@@ -21,19 +23,55 @@ app = FastAPI(title="Sai OS Agent Cloud Backend")
 
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+# CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 GEMINI_WS_URL = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={GEMINI_API_KEY}"
 
-cerebras_client = AsyncOpenAI(
-    api_key=CEREBRAS_API_KEY,
-    base_url="https://api.cerebras.ai/v1"
-)
+# cerebras_client = AsyncOpenAI(
+#     api_key=CEREBRAS_API_KEY,
+#     base_url="https://api.cerebras.ai/v1"
+# )
 
 openrouter_client = AsyncOpenAI(
     api_key=OPENROUTER_API_KEY,
-    base_url="https://openrouter.ai/api/v1"
+    base_url="https://api.cerebras.ai/v1" if not OPENROUTER_API_KEY else "https://openrouter.ai/api/v1"
 )
+
+MAX_AGENT_STEPS = 10
+ACTION_SETTLE_TIME = 2.0  # seconds to wait after an action for the UI to update
+SCREENSHOT_TIMEOUT = 5.0  # seconds to wait for a screenshot from client
+
+def annotate_screenshot(image_b64: str) -> str:
+    """Draw coordinate axis labels on the screenshot edges so the vision model can estimate click positions."""
+    try:
+        img_bytes = base64.b64decode(image_b64)
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        w, h = img.size
+        
+        # Use a small default font
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 14)
+        except:
+            font = ImageFont.load_default()
+        
+        # Draw X-axis labels along the top edge
+        for x in range(0, w, 200):
+            draw.text((x + 2, 2), str(x), fill="red", font=font)
+            draw.line([(x, 0), (x, 15)], fill="red", width=1)
+        
+        # Draw Y-axis labels along the left edge
+        for y in range(0, h, 200):
+            draw.text((2, y + 2), str(y), fill="red", font=font)
+            draw.line([(0, y), (15, y)], fill="red", width=1)
+        
+        # Encode back to base64 PNG
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        logger.error(f"Failed to annotate screenshot: {e}")
+        return image_b64  # fallback to original
 
 @app.get("/")
 async def root():
@@ -45,10 +83,17 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info("New client connection established")
     
     # Shared state between upstream and downstream
+    # Event to coordinate screenshot arrivals between upstream and the agent loop
+    screenshot_event = asyncio.Event()
+    
     connection_state = {
         "last_call_id": None,
-        "recent_model_replies": collections.deque(maxlen=3), # Tracks last few things Gemini said
-        "latest_sight": "No visual context yet." # Tracks the last screen description from Gemini
+        "recent_model_replies": collections.deque(maxlen=3),
+        "latest_sight": "No visual context yet.",
+        "latest_screenshot_b64": None,
+        "transcription_buffer": [],
+        "debounce_task": None,
+        "agent_running": False  # Prevents concurrent agent loops
     }
     
     if not GEMINI_API_KEY:
@@ -68,6 +113,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 # Acknowledge handshake
                 await websocket.send_json({"status": "handshake_complete"})
+                
+                # AUTO-TRIGGER SCREENSHOT: Ensure we have "Fresh Eyes" for the upcoming command
+                logger.info("Auto-triggering initial screenshot for visual context.")
+                await websocket.send_text(json.dumps({"command": "capture_screen"}))
             else:
                 logger.warning(f"Unexpected initial event: {event_payload}")
                 await websocket.close(code=1003) # Unsupported Data
@@ -139,9 +188,14 @@ async def websocket_endpoint(websocket: WebSocket):
                                 data = json.loads(message["text"])
                                 if data.get("event") == "screen_captured":
                                     image_b64 = data.get("image_base64")
+                                    # Store locally for Senior Brain
+                                    connection_state["latest_screenshot_b64"] = image_b64
+                                    # Signal any waiting agent loop that a new screenshot is ready
+                                    screenshot_event.set()
+                                    
                                     width = data.get("width", 1920)
                                     height = data.get("height", 1080)
-                                    logger.info(f"Received screen capture from client ({width}x{height}). Forwarding to Gemini.")
+                                    logger.info(f"Received screen capture from client ({width}x{height}). Stored and forwarding to Gemini.")
                                     # Forward as user turn with an image part
                                     # This avoids "Invalid Argument" for tool IDs and allows Gemini to "see"
                                     client_content_payload = {
@@ -181,65 +235,43 @@ async def websocket_endpoint(websocket: WebSocket):
                         except RuntimeError:
                             pass
 
-            async def hybrid_reasoning(user_text, latest_sight):
-                """Routes task to Llama (simple) or Gemini 3.1/OpenRouter (advanced)."""
-                # STEP 1: Routing Decision (Llama 3.1-8b)
-                # Heuristic: If it looks like a URL, it's likely advanced navigation
-                url_keywords = [".com", ".org", ".net", ".io", "http", "www"]
+            async def hybrid_reasoning(user_text, latest_sight, latest_image_b64):
+                """Routes task to Llama (simple) or Gemini 3 (advanced + vision)."""
+                # STEP 1: Routing Decision (Llama 3.3-70b)
+                # Heuristic: If it looks like a URL or complex intent, ADVANCED.
+                url_keywords = [".com", ".org", ".net", ".io", "http", "www", "search", "navigate", "go to", "find"]
                 if any(k in user_text.lower() for k in url_keywords):
-                    logger.info("URL-like input detected, auto-escalating to ADVANCED.")
                     complexity = "ADVANCED"
                 else:
-                    routing_prompt = f"""You are the strict Task Routing AI for a multi-modal agentic system. 
-Your only objective is to analyze the user's command and the current screen context, then classify the task's complexity.
+                    routing_prompt = f"""You are the Task Router for Sai.
+Analyze the user command. Determine if it can be handled by a simple app launch or if it needs the Senior Brain (Vision/Browsing/Complex Apps).
 
-DEFINITIONS:
-- SIMPLE: Basic OS-level commands, opening or closing local applications, simple system toggles, or greetings. 
-- ADVANCED: Anything involving web navigation, URLs, research, multi-step actions, or specific interactions inside a website or application.
-
-RULES:
-1. You MUST output ONLY valid JSON. Do not include markdown code blocks (```json), preambles, or conversational text.
-2. You MUST think step-by-step in a "reasoning" field BEFORE outputting the "complexity" field.
-
-EXAMPLES:
-User: "Open Safari"
-Current Sight: "Desktop wallpaper"
-Output: {{"reason": "The user wants to launch a local application, which is a basic OS-level command.", "complexity": "SIMPLE"}}
-
-User: "Search for tide pods on Amazon"
-Current Sight: "Safari homepage"
-Output: {{"reason": "The user is asking to navigate a specific website and perform a search, requiring web navigation.", "complexity": "ADVANCED"}}
-
-User: "Take a screenshot"
-Current Sight: "A YouTube video playing"
-Output: {{"reason": "Taking a screenshot is a basic system toggle.", "complexity": "SIMPLE"}}
+SIMPLE: "Open Spotify", "Launch Terminal", "Hi", "Volume up", "Screenshot".
+ADVANCED: "Add this song to my likes", "Buy tide pods", "Check my physics homework on Canvas", "Translate the text on my screen".
 
 User said: "{user_text}"
-Current Sight: "{latest_sight}"
-"""
+Output valid JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
                     
                     try:
-                        routing_completion = await cerebras_client.chat.completions.create(
-                            model="llama3.1-8b",
+                        routing_completion = await openrouter_client.chat.completions.create(
+                            model="nvidia/nemotron-3-super-120b-a12b:free",
                             messages=[{"role": "system", "content": routing_prompt}],
                             response_format={"type": "json_object"}
                         )
                         routing_data = json.loads(routing_completion.choices[0].message.content)
-                        complexity = routing_data.get("complexity", "SIMPLE")
+                        complexity = routing_data.get("complexity", "SIMPLE").strip().upper()
                         logger.info(f"Routing Decision: {complexity}")
                     except Exception as e:
                         logger.error(f"Routing Error: {e}")
-                        complexity = "SIMPLE" # Fallback
+                        complexity = "SIMPLE"
 
                 # STEP 2: Execution
                 if complexity == "SIMPLE":
-                    # Use Llama for simple tool extraction
-                    system_prompt = """You are the tool extractor for Sai. Output ONLY JSON.
-Tools: type_text(text), capture_screen(), click(x,y), greet(message).
-If User: "Open Safari" → {"command": "type_text", "text": "Safari"}"""
+                    system_prompt = """You are the tool extractor. Output ONLY JSON.
+Example: "Open Safari" -> {"command": "type_text", "text": "Safari"}"""
                     try:
-                        completion = await cerebras_client.chat.completions.create(
-                            model="llama3.1-8b",
+                        completion = await openrouter_client.chat.completions.create(
+                            model="nvidia/nemotron-3-super-120b-a12b:free",
                             messages=[
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": user_text}
@@ -249,38 +281,182 @@ If User: "Open Safari" → {"command": "type_text", "text": "Safari"}"""
                         return json.loads(completion.choices[0].message.content)
                     except: return None
                 else:
-                    # Use Seniors Brain (OpenRouter Gemini 3 Flash Preview)
-                    senior_prompt = f"""You are Sai's Advanced Brain (Gemini 3). 
-You have access to the user's screen through descriptions.
-CURRENT SIGHT: "{latest_sight}"
+                    # ADVANCED: Launch multi-step agent loop
+                    asyncio.create_task(run_agent_loop(user_text))
+                    return None  # Agent loop handles sending commands directly
 
-TOOLS:
-1. type_text(text) - To search or enter URLs. "text" should be the query or URL.
-2. capture_screen() - If you need to see the screen AGAIN to verify an action.
-3. click(x, y) - To click coordinates.
+            async def run_agent_loop(user_text):
+                """Multi-step agentic loop: observe → think → act → repeat."""
+                if connection_state["agent_running"]:
+                    logger.warning("Agent loop already running, skipping.")
+                    return
+                connection_state["agent_running"] = True
+                
+                SENIOR_SYSTEM_PROMPT = """You are Sai's Advanced Brain. You control a macOS computer by looking at screenshots and executing actions step-by-step.
 
-OUTPUT FORMAT (JSON ONLY):
-{{"command": "type_text", "text": "URL or search query"}}
-{{"command": "capture_screen"}}
-{{"command": "click", "x": horizontal, "y": vertical}}
+YOU CAN SEE THE SCREENSHOT. It has RED coordinate labels along the top (X-axis) and left (Y-axis) edges every 200 pixels. USE THESE to estimate click coordinates.
 
-PLAN: Analyze the request and the screen. If you need to open a website, start by using type_text.
-User: "{user_text}" """
-                    try:
-                        completion = await openrouter_client.chat.completions.create(
-                            model="google/gemini-3-flash-preview", 
-                            messages=[
-                                {"role": "system", "content": senior_prompt},
-                                {"role": "user", "content": user_text}
-                            ],
-                            response_format={"type": "json_object"}
-                        )
-                        content = completion.choices[0].message.content
-                        logger.info(f"OpenRouter Response: {content}")
-                        return json.loads(content)
-                    except Exception as e:
-                        logger.error(f"OpenRouter Error: {e}")
-                        return None
+TOOLS (always use the "command" key):
+1. open_url(url) - opens a URL in the default browser immediately. ALWAYS use this for web navigation.
+2. click(x, y) - clicks at exact pixel coordinates. Read the RED labels to estimate x and y precisely.
+3. keyboard_type(text) - types text into the CURRENTLY FOCUSED element on screen. Only works if something is already focused.
+4. type_text(text) - opens macOS Spotlight, types text, and launches it. Use only to open apps by name.
+
+CRITICAL RULES:
+- Output a SINGLE JSON object per response. No extra text, no markdown, no code fences.
+- Always include "explanation" and "done" in every response.
+- "done": false means more steps are coming. "done": true ONLY when you can confirm in the current screenshot that the task has been completed successfully.
+- NEVER set "done": true alongside a command that needs to be executed. If you still have an action to take, set "done": false.
+- After each step you will receive a FRESH screenshot of the result. Use it to decide your next action.
+- If keyboard_type fails (text doesn't appear), try clicking the target field first, then keyboard_type again.
+
+Examples:
+{"explanation": "Opening amazon.com directly", "command": "open_url", "url": "https://www.amazon.com", "done": false}
+{"explanation": "Amazon has loaded successfully, task is complete", "command": "none", "done": true}
+{"explanation": "Clicking search bar at ~(500, 130) based on grid", "command": "click", "x": 500, "y": 130, "done": false}"""
+                
+                conversation_history = [
+                    {"role": "system", "content": SENIOR_SYSTEM_PROMPT}
+                ]
+                
+                logger.info(f"========== AGENT LOOP STARTED for: '{user_text}' ==========")
+                
+                try:
+                    for step in range(MAX_AGENT_STEPS):
+                        # 1. Get current screenshot
+                        current_screenshot = connection_state["latest_screenshot_b64"]
+                        if not current_screenshot:
+                            logger.error("No screenshot available for agent loop.")
+                            break
+                        
+                        # 2. Annotate with grid
+                        annotated = annotate_screenshot(current_screenshot)
+                        
+                        # 3. Build user message with screenshot
+                        step_label = f"Step {step + 1}/{MAX_AGENT_STEPS}"
+                        if step == 0:
+                            user_content = [{"type": "text", "text": f"[{step_label}] Task: {user_text}"}, 
+                                           {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{annotated}"}}]
+                        else:
+                            user_content = [{"type": "text", "text": f"[{step_label}] Here is the updated screenshot after the previous action. Continue the task."}, 
+                                           {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{annotated}"}}]
+                        
+                        conversation_history.append({"role": "user", "content": user_content})
+                        
+                        # 4. Call Senior Brain
+                        try:
+                            completion = await openrouter_client.chat.completions.create(
+                                model="google/gemini-3-flash-preview",
+                                messages=conversation_history
+                            )
+                            raw_content = completion.choices[0].message.content
+                            logger.info(f"[Step {step + 1}] Senior Brain Response: {raw_content}")
+                            
+                            # Add assistant response to history
+                            conversation_history.append({"role": "assistant", "content": raw_content})
+                            
+                            # Parse — try to extract JSON from the response
+                            # Strip markdown code fences if present
+                            cleaned = raw_content.strip()
+                            if cleaned.startswith("```"):
+                                cleaned = cleaned.split("\n", 1)[-1]
+                                cleaned = cleaned.rsplit("```", 1)[0]
+                            
+                            data = json.loads(cleaned)
+                            if isinstance(data, list) and len(data) > 0:
+                                data = data[0]
+                            if "action" in data and "command" not in data:
+                                data["command"] = data["action"]
+                            
+                        except Exception as e:
+                            logger.error(f"[Step {step + 1}] Senior Brain Error: {e}")
+                            break
+                        
+                        # 5. Execute the command first (even if done, command may still need to run)
+                        cmd = data.get("command")
+                        if cmd and cmd != "none":
+                            logger.info(f"[Step {step + 1}] Executing: {data}")
+                            await websocket.send_text(json.dumps(data))
+                            # Wait for action to settle
+                            await asyncio.sleep(ACTION_SETTLE_TIME)
+                        
+                        # 6. Check if done AFTER executing
+                        if data.get("done") == True:
+                            logger.info(f"[Step {step + 1}] Agent reports DONE: {data.get('explanation', '')}")
+                            break
+                        
+                        if not cmd or cmd == "none":
+                            logger.info(f"[Step {step + 1}] No command and not done — breaking to avoid infinite loop.")
+                            break
+                        
+                        # 8. Request a fresh screenshot
+                        screenshot_event.clear()
+                        await websocket.send_text(json.dumps({"command": "capture_screen"}))
+                        
+                        # 9. Wait for the screenshot to arrive via upstream
+                        try:
+                            await asyncio.wait_for(screenshot_event.wait(), timeout=SCREENSHOT_TIMEOUT)
+                            logger.info(f"[Step {step + 1}] Fresh screenshot received.")
+                        except asyncio.TimeoutError:
+                            logger.error(f"[Step {step + 1}] Timed out waiting for screenshot.")
+                            break
+                    else:
+                        logger.warning(f"Agent loop hit max steps ({MAX_AGENT_STEPS}).")
+                
+                except Exception as e:
+                    logger.error(f"Agent loop error: {e}")
+                finally:
+                    connection_state["agent_running"] = False
+                    logger.info("========== AGENT LOOP ENDED ==========")
+
+            async def process_complete_transcription():
+                """Process the fully accumulated transcription buffer."""
+                full_text = "".join(connection_state["transcription_buffer"]).strip()
+                connection_state["transcription_buffer"] = []
+                connection_state["debounce_task"] = None
+                
+                if not full_text:
+                    return
+                
+                logger.info(f"=== COMPLETE TRANSCRIPTION: '{full_text}' ===")
+                
+                # ECHO SUPPRESSION
+                normalized_input = "".join(filter(str.isalnum, full_text.lower()))
+                is_echo = False
+                for reply in list(connection_state["recent_model_replies"]):
+                    normalized_reply = "".join(filter(str.isalnum, reply.lower()))
+                    if normalized_reply and (normalized_reply in normalized_input or normalized_input in normalized_reply):
+                        is_echo = True
+                        break
+                
+                if is_echo:
+                    logger.info(f"Ignored echo transcription: '{full_text}'")
+                    return
+                
+                logger.info(f"!!! TRIGGERING HYBRID BRAIN FOR: {full_text}")
+                try:
+                    action = await hybrid_reasoning(
+                        full_text, 
+                        connection_state["latest_sight"],
+                        connection_state["latest_screenshot_b64"]
+                    )
+                    if action and action.get("command") != "none":
+                        cmd = action.get("command")
+                        if cmd not in ["type_text", "capture_screen", "click", "open_url", "keyboard_type"]:
+                            logger.warning(f"Brain returned unknown command: {action}")
+                        
+                        if cmd == "type_text" and not action.get("text", "").strip():
+                            logger.info("Ignoring empty type_text command")
+                        else:
+                            logger.info(f"Forwarding action to client: {action}")
+                            await websocket.send_text(json.dumps(action))
+                except Exception as e:
+                    logger.error(f"Failed to process hybrid brain action: {e}")
+
+            async def debounce_and_process():
+                """Wait 1.5s of silence, then process the accumulated buffer."""
+                await asyncio.sleep(1.5)
+                await process_complete_transcription()
 
             async def downstream():
                 """Google -> Client"""
@@ -307,46 +483,31 @@ User: "{user_text}" """
                                         if audio_data_b64:
                                             audio_binary = base64.b64decode(audio_data_b64)
                                             await websocket.send_bytes(audio_binary)
-                                            # logger.debug(f"Forwarded {len(audio_binary)} bytes to client")
                             
                             # Handle Input Transcriptions (user speech → text)
                             input_transcription = response["serverContent"].get("inputTranscription")
                             if input_transcription:
                                 text = input_transcription.get("text", "")
                                 if text.strip():
-                                    logger.info(f"--- RAW GEMINI TRANSCRIPTION: '{text}' ---")
+                                    logger.info(f"--- FRAGMENT: '{text}' (buffer: {''.join(connection_state['transcription_buffer'])}) ---")
                                     
-                                    # ECHO SUPPRESSION: Check if this matches something we just said
-                                    # Normalize (lowercase, remove punctuation) for better matching
-                                    normalized_input = "".join(filter(str.isalnum, text.lower()))
-                                    is_echo = False
-                                    for reply in list(connection_state["recent_model_replies"]):
-                                        normalized_reply = "".join(filter(str.isalnum, reply.lower()))
-                                        if normalized_reply and (normalized_reply in normalized_input or normalized_input in normalized_reply):
-                                            is_echo = True
-                                            break
+                                    # Append fragment to buffer
+                                    connection_state["transcription_buffer"].append(text)
                                     
-                                    if is_echo:
-                                        logger.info(f"Ignored echo transcription: '{text}'")
-                                    else:
-                                        logger.info(f"!!! TRIGGERING HYBRID BRAIN FOR: {text}")
-                                        cerebras_action = await hybrid_reasoning(text, connection_state["latest_sight"])
-                                        if cerebras_action and cerebras_action.get("command") != "none":
-                                            # Logger for non-standard commands (hallucinations)
-                                            cmd = cerebras_action.get("command")
-                                            if cmd not in ["type_text", "capture_screen", "click"]:
-                                                logger.warning(f"Cerebras returned unknown command/error: {cerebras_action}")
-                                                # Still forward it so we can see it in client logs, 
-                                                # but it won't be executed by the standard client commands
-                                            
-                                            # Guard against empty commands
-                                            if cmd == "type_text" and not cerebras_action.get("text", "").strip():
-                                                logger.info("Ignoring empty type_text command")
-                                            else:
-                                                logger.info(f"Forwarding Cerebras action to client: {cerebras_action}")
-                                                await websocket.send_text(json.dumps(cerebras_action))
-                                else:
-                                    logger.debug("Received empty/whitespace transcription from Gemini")
+                                    # Cancel any pending debounce timer
+                                    if connection_state["debounce_task"]:
+                                        connection_state["debounce_task"].cancel()
+                                    
+                                    # Start a new 1.5s debounce timer
+                                    connection_state["debounce_task"] = asyncio.create_task(debounce_and_process())
+                            
+                            # Handle turnComplete — flush buffer immediately
+                            turn_complete = response["serverContent"].get("turnComplete", False)
+                            if turn_complete and connection_state["transcription_buffer"]:
+                                logger.info("Turn complete signal received, flushing buffer.")
+                                if connection_state["debounce_task"]:
+                                    connection_state["debounce_task"].cancel()
+                                await process_complete_transcription()
                             
                             # Handle Output Transcriptions (model speech → text)
                             output_transcription = response["serverContent"].get("outputTranscription")

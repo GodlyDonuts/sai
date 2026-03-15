@@ -170,6 +170,30 @@ def perform_type_sync(text: str):
     time.sleep(0.2)
     pyautogui.press('enter')  # Redundant enter to be sure
 
+def perform_keyboard_type_sync(text: str):
+    """Types text directly into the currently focused field using clipboard paste (reliable on macOS)."""
+    import subprocess
+    # Handle newlines as Enter keypresses
+    parts = text.split("\n")
+    for i, part in enumerate(parts):
+        if part:
+            # Copy to clipboard and paste — much more reliable than pyautogui.write on macOS
+            process = subprocess.run(["pbcopy"], input=part.encode("utf-8"), capture_output=True)
+            pyautogui.hotkey("command", "v")
+            time.sleep(0.1)
+        if i < len(parts) - 1:
+            pyautogui.press("enter")
+            time.sleep(0.1)
+
+def perform_open_url_sync(url: str):
+    """Opens a URL directly in the default browser."""
+    # Ensure URL looks valid enough
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    import subprocess
+    logging.info(f"Navigating to: {url}")
+    subprocess.run(["open", url])
+
 async def receive_audio_from_websocket(websocket, output_stream):
     """
     Listens for binary audio data from the WebSocket and writes it to the PyAudio output stream.
@@ -229,6 +253,16 @@ async def receive_audio_from_websocket(websocket, output_stream):
                         text = data.get("text", "")
                         await loop.run_in_executor(None, perform_type_sync, text)
                         logging.info(f"Typed text via Spotlight: {text}")
+
+                    elif command == "open_url":
+                        url = data.get("url", "")
+                        await loop.run_in_executor(None, perform_open_url_sync, url)
+                        logging.info(f"Opened URL directly: {url}")
+
+                    elif command == "keyboard_type":
+                        text = data.get("text", "")
+                        await loop.run_in_executor(None, perform_keyboard_type_sync, text)
+                        logging.info(f"Typed text into focused field: {text}")
 
                 except json.JSONDecodeError:
                     logging.warning(f"Received unknown message type: {message}")
