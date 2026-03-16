@@ -15,7 +15,7 @@ Sai is a voice-native OS co-pilot for macOS. It uses a **Hybrid Brain** architec
 
 ## Current Status (March 15, 2026) — ✅ Functional
 
-The full end-to-end pipeline is **working**. Wake word is detected, audio streams to the cloud, Gemini transcribes, and the brain issues real OS commands that execute on the Mac.
+The full end-to-end pipeline is **working**. Wake word is detected, audio streams to the cloud, Deepgram transcribes, and the Amazon Nova brain issues real OS commands that execute on the Mac.
 
 ### Architecture Flow
 1. **User says "Hey Sai..."** → `wake_word.py` detects wake word via Picovoice Porcupine
@@ -60,7 +60,7 @@ The full end-to-end pipeline is **working**. Wake word is detected, audio stream
 ## Known Issues / Limitations
 
 - **Spotify search bar** — `keyboard_type` after `click` is inconsistent; Spotify may need a keyboard shortcut (`Cmd+L`) to reliably focus the search bar
-- **Transcription fragments** — Gemini sometimes fires `turnComplete` early, causing the 1.5s debounce to flush a partial sentence
+- **Transcription fragments** — Deepgram sometimes fires intermediate transcripts, handled by a 1.5s debounce to ensure full sentence processing
 - **SIMPLE routing too aggressive** — Some commands that need vision (e.g. "create a new document") are routed as SIMPLE and produce hallucinated commands
 
 ## Next Steps

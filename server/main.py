@@ -5,15 +5,12 @@ import asyncio
 import os
 import io
 import collections
+import typing
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from datetime import datetime
-import boto3
-from deepgram import (
-    DeepgramClient,
-    DeepgramClientOptions,
-    LiveTranscriptionEvents,
-    LiveOptions,
-)
+from openai import OpenAI
+from deepgram import AsyncDeepgramClient
+from deepgram.core.events import EventType
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
@@ -28,20 +25,29 @@ app = FastAPI(title="Sai OS Agent Cloud Backend (Nova + Deepgram)")
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
-# Bedrock setup for Amazon Nova
-session = boto3.Session(
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    region_name=os.getenv("AWS_REGION", "us-east-1")
+# Nova Setup via OpenAI Proxy
+nova_client = OpenAI(
+    api_key=os.getenv("AMAZON_NOVA_API_KEY"),
+    base_url=os.getenv("NOVA_BASE_URL", "https://api.nova.amazon.com/v1")
 )
-bedrock_runtime = session.client(service_name='bedrock-runtime')
 
-NOVA_LITE_MODEL_ID = "amazon.nova-lite-v1:0"
-NOVA_PRO_MODEL_ID = "amazon.nova-pro-v1:0"
+NOVA_LITE_MODEL_ID = "nova-2-lite-v1"
+NOVA_PRO_MODEL_ID = "nova-2-pro-v1"
 
 MAX_AGENT_STEPS = 10
 ACTION_SETTLE_TIME = 2.0  # seconds to wait after an action for the UI to update
 SCREENSHOT_TIMEOUT = 5.0  # seconds to wait for a screenshot from client
+
+def extract_json(text: str) -> typing.Optional[dict]:
+    """Robustly extract JSON from potentially verbose model output."""
+    try:
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1:
+            return json.loads(text[start:end+1])
+    except Exception as e:
+        logger.error(f"JSON extraction failed: {e} | Raw: {text[:100]}...")
+    return None
 
 def annotate_screenshot(image_b64: str, last_action: dict = None) -> str:
     """Draw minimal edge-only ruler ticks and optional last action marker on the screenshot.
@@ -113,6 +119,7 @@ async def websocket_endpoint(websocket: WebSocket):
         "transcription_buffer": [],
         "debounce_task": None,
         "active_agent_task": None,
+        "command_triggered": False,
         "screenshot_event": asyncio.Event()
     }
     
@@ -137,28 +144,51 @@ async def websocket_endpoint(websocket: WebSocket):
         # Define reasoning inside so it has access to websocket and state
         async def hybrid_reasoning(user_text, latest_sight, latest_image_b64):
             """Routes task to Nova Lite (simple/routing) or Nova Pro (advanced + vision)."""
-            routing_prompt = f"""You are the Task Router for Sai. Determine complexity: SIMPLE or ADVANCED.\nUser said: "{user_text}"\nOutput JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
+            routing_prompt = f"""You are the Task Router for Sai, a macOS assistant. 
+Determine if the task is SIMPLE (one-off action like "Open Safari", "Type hello") 
+or ADVANCED (complex, multi-step, visual analysis needed, or research/answering questions).
+User said: "{user_text}"
+Output JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
             try:
-                body = json.dumps({
-                    "system": [{"text": "Output JSON only."}],
-                    "messages": [{"role": "user", "content": [{"text": routing_prompt}]}],
-                    "inferenceConfig": {"max_tokens": 64, "temperature": 0}
-                })
-                response = bedrock_runtime.invoke_model(modelId=NOVA_LITE_MODEL_ID, body=body)
-                routing_data = json.loads(json.loads(response.get('body').read())['output']['message']['content'][0]['text'])
+                response = nova_client.chat.completions.create(
+                    model=NOVA_LITE_MODEL_ID,
+                    messages=[
+                        {"role": "system", "content": "Output JSON only."},
+                        {"role": "user", "content": routing_prompt}
+                    ],
+                    temperature=0
+                )
+                raw_routing = response.choices[0].message.content
+                routing_data = extract_json(raw_routing)
+                if not routing_data:
+                    raise ValueError(f"No JSON found in routing response: {raw_routing}")
+                
                 complexity = routing_data.get("complexity", "SIMPLE").upper()
-            except: complexity = "SIMPLE"
+                logger.info(f"Routing logic (Nova Lite): {complexity}")
+            except Exception as e: 
+                logger.error(f"Routing failed, defaulting to SIMPLE: {e}")
+                complexity = "SIMPLE"
 
             if complexity == "SIMPLE":
                 try:
-                    body = json.dumps({
-                        "system": [{"text": "Convert to tool JSON. e.g. 'Open Safari' -> {\"command\": \"type_text\", \"text\": \"Safari\"}"}],
-                        "messages": [{"role": "user", "content": [{"text": user_text}]}],
-                        "inferenceConfig": {"max_tokens": 128, "temperature": 0}
-                    })
-                    resp = bedrock_runtime.invoke_model(modelId=NOVA_LITE_MODEL_ID, body=body)
-                    return json.loads(json.loads(resp.get('body').read())['output']['message']['content'][0]['text'])
-                except: return None
+                    resp = nova_client.chat.completions.create(
+                        model=NOVA_LITE_MODEL_ID,
+                        messages=[
+                            {"role": "system", "content": "Convert to tool JSON. Valid commands: type_text (text), open_url (url). e.g. 'Open Safari' -> {\"command\": \"type_text\", \"text\": \"Safari\"}"},
+                            {"role": "user", "content": user_text}
+                        ],
+                        temperature=0
+                    )
+                    raw_simple = resp.choices[0].message.content
+                    result = extract_json(raw_simple)
+                    if not result:
+                        raise ValueError(f"No JSON found in simple generation: {raw_simple}")
+                    
+                    logger.info(f"SIMPLE action generated: {result}")
+                    return result
+                except Exception as e:
+                    logger.error(f"SIMPLE generation failed: {e}")
+                    return None
             else:
                 if connection_state["active_agent_task"] and not connection_state["active_agent_task"].done():
                     connection_state["active_agent_task"].cancel()
@@ -166,29 +196,58 @@ async def websocket_endpoint(websocket: WebSocket):
                 return None
 
         async def run_agent_loop(user_text):
+            logger.info(f"Starting Agent Loop for task: {user_text}")
             SENIOR_SYSTEM_PROMPT = "You control macOS via screenshots. Tools: open_url, click(x,y), keyboard_type, type_text, wait, press_hotkey, scroll. Output JSON: {'explanation': '...', 'command': '...', 'done': bool}"
             conversation_history = [{"role": "system", "content": SENIOR_SYSTEM_PROMPT}]
+            last_action = None
+            
             try:
+                # Ensure we have at least one screenshot before beginning
+                if not connection_state["latest_screenshot_b64"]:
+                    logger.info("Waiting for initial screenshot...")
+                    try:
+                        await asyncio.wait_for(connection_state["screenshot_event"].wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.error("Initial screenshot timeout.")
+                        return
+
                 for step in range(MAX_AGENT_STEPS):
                     current_screenshot = connection_state["latest_screenshot_b64"]
-                    if not current_screenshot: break
-                    annotated = annotate_screenshot(current_screenshot, last_data)
-                    user_content = [{"text": f"Task: {user_text}" if step == 0 else "Continue task."}, {"image": {"format": "png", "source": {"bytes": annotated}}}]
+                    if not current_screenshot:
+                        logger.error("No screenshot available at step start.")
+                        break
+                    
+                    logger.info(f"Agent Step {step+1}/{MAX_AGENT_STEPS} starting...")
+                    annotated = annotate_screenshot(current_screenshot, last_action)
+                    
+                    user_text_msg = f"Task: {user_text}" if step == 0 else "Continue task."
+                    user_content = [
+                        {"type": "text", "text": user_text_msg},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{annotated}"
+                            }
+                        }
+                    ]
                     conversation_history.append({"role": "user", "content": user_content})
                     
-                    # Bedrock call
-                    body = json.dumps({
-                        "system": [{"text": SENIOR_SYSTEM_PROMPT}],
-                        "messages": [h for h in conversation_history if h["role"] != "system"],
-                        "inferenceConfig": {"max_tokens": 1024, "temperature": 0.2}
-                    })
-                    response = bedrock_runtime.invoke_model(modelId=NOVA_PRO_MODEL_ID, body=body)
-                    raw_content = json.loads(response.get('body').read())['output']['message']['content'][0]['text']
-                    conversation_history.append({"role": "assistant", "content": [{"text": raw_content}]})
+                    response = nova_client.chat.completions.create(
+                        model=NOVA_PRO_MODEL_ID,
+                        messages=conversation_history,
+                        temperature=0.2
+                    )
+                    raw_content = response.choices[0].message.content
+                    conversation_history.append({"role": "assistant", "content": raw_content})
                     
-                    data = json.loads(raw_content[raw_content.find('{'):raw_content.rfind('}')+1])
+                    data = extract_json(raw_content)
+                    if not data:
+                        logger.error(f"Agent failed to produce JSON: {raw_content}")
+                        break
+
                     cmd = data.get("command")
                     if cmd and cmd != "none":
+                        last_action = data
                         await websocket.send_text(json.dumps(data))
                         await asyncio.sleep(ACTION_SETTLE_TIME)
                     if data.get("done"): break
@@ -199,43 +258,93 @@ async def websocket_endpoint(websocket: WebSocket):
             except Exception as e: logger.error(f"Agent error: {e}")
 
         async def process_complete_transcription():
+            if connection_state["command_triggered"]: return
             full_text = " ".join(connection_state["transcription_buffer"]).strip()
             connection_state["transcription_buffer"] = []
             if not full_text: return
-            logger.info(f"Processing: {full_text}")
+            
+            connection_state["command_triggered"] = True
+            logger.info(f"Processing (One-Shot): {full_text}")
+            
+            # Cancel any pending debounce
+            if connection_state["debounce_task"]: connection_state["debounce_task"].cancel()
+            
             action = await hybrid_reasoning(full_text, connection_state["latest_sight"], connection_state["latest_screenshot_b64"])
             if action: await websocket.send_text(json.dumps(action))
+            
+            # Wait for agent loop if it was started
+            if connection_state["active_agent_task"]:
+                try: await connection_state["active_agent_task"]
+                except asyncio.CancelledError: pass
+            
+            # Finalize session to return to wake-word mode
+            logger.info("One-shot command complete. Closing session.")
+            await websocket.close()
 
         async def debounce_and_process():
             await asyncio.sleep(1.5)
             await process_complete_transcription()
 
-        def on_message(self, result, **kwargs):
-            sentence = result.channel.alternatives[0].transcript
-            if sentence.strip():
-                connection_state["transcription_buffer"].append(sentence)
-                loop = asyncio.get_event_loop()
-                if connection_state["debounce_task"]: connection_state["debounce_task"].cancel()
-                connection_state["debounce_task"] = loop.create_task(debounce_and_process())
-
         # Initialize Deepgram
-        deepgram = DeepgramClient(DEEPGRAM_API_KEY)
-        dg_connection = deepgram.listen.live.v("1")
-        dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
-        dg_connection.start(LiveOptions(model="nova-2-general", language="en-US", encoding="linear16", channels=1, sample_rate=16000))
+        deepgram = AsyncDeepgramClient(api_key=DEEPGRAM_API_KEY)
+        
+        async with deepgram.listen.v1.connect(
+            model="nova-2-general", 
+            language="en-US", 
+            encoding="linear16", 
+            channels="1", 
+            sample_rate="16000"
+        ) as dg_socket:
+            
+            async def on_message(result: typing.Any):
+                if result.type == "Results":
+                    # If we already triggered a command, ignore further audio chunks
+                    if connection_state["command_triggered"]: return
 
-        while True:
-            message = await websocket.receive()
-            if message.get("bytes"):
-                dg_connection.send(message.get("bytes"))
-            elif message.get("text"):
-                data = json.loads(message["text"])
-                if data.get("event") == "screen_captured":
-                    connection_state["latest_screenshot_b64"] = data.get("image_base64")
-                    connection_state["screenshot_event"].set()
-    except Exception as e: logger.error(f"WebSocket error: {e}")
+                    # Only buffer 'is_final' transcripts to prevent duplicate partial merges
+                    if result.is_final and result.channel.alternatives[0].transcript:
+                        sentence = result.channel.alternatives[0].transcript
+                        if sentence.strip():
+                            connection_state["transcription_buffer"].append(sentence)
+                            logger.info(f"Buffered (is_final): {sentence}")
+                            
+                            # If Deepgram thinks the speech is truly finished, process immediately
+                            if result.speech_final:
+                                if connection_state["debounce_task"]: connection_state["debounce_task"].cancel()
+                                await process_complete_transcription()
+                                return
+
+                            # Reset debounce timer for cases where speech_final isn't triggered yet
+                            if connection_state["debounce_task"]: connection_state["debounce_task"].cancel()
+                            connection_state["debounce_task"] = asyncio.create_task(debounce_and_process())
+
+            dg_socket.on(EventType.MESSAGE, on_message)
+            listening_task = asyncio.create_task(dg_socket.start_listening())
+
+            try:
+                while True:
+                    if connection_state["command_triggered"]:
+                        # If a one-shot command was triggered, we stop receiving and let the session close
+                        break
+                        
+                    message = await websocket.receive()
+                    if message.get("bytes"):
+                        await dg_socket.send_media(message.get("bytes"))
+                    elif message.get("text"):
+                        data = json.loads(message["text"])
+                        if data.get("event") == "screen_captured":
+                            connection_state["latest_screenshot_b64"] = data.get("image_base64")
+                            connection_state["screenshot_event"].set()
+            except WebSocketDisconnect:
+                logger.info("Client disconnected")
+            finally:
+                listening_task.cancel()
+                await dg_socket.send_finalize()
+    except Exception as e: 
+        logger.error(f"WebSocket error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
     finally:
-        if 'dg_connection' in locals(): dg_connection.finish()
         logger.info("Session ended")
 
 if __name__ == "__main__":
