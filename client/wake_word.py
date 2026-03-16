@@ -19,9 +19,10 @@ import io
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
-# Global variables to store the exact dimensions of the last capture
-latest_screenshot_width = 2560
-latest_screenshot_height = 1600
+# Canonical vision canvas for Sai on M1 MacBook Pro.
+# Nova always reasons on this 1440x900 logical space.
+LOGICAL_CANVAS_WIDTH = 1440
+LOGICAL_CANVAS_HEIGHT = 900
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -142,43 +143,72 @@ class WakeWordDetector:
 # ==============================================================================
 
 def capture_screen_sync() -> dict:
-    """Captures screen natively, then resizes to logical display size for 1:1 brain mapping."""
+    """Captures screen natively, then resizes to the fixed 1440x900 canvas used by the agent."""
     file_path = "/tmp/sai_capture.png"
     
     try:
-        # 1. Native macOS capture (e.g., 2880x1800 on Retina)
+        # 1. Native macOS capture (e.g., 2560x1600 on Retina)
         subprocess.run(["screencapture", "-x", "-C", file_path], check=True)
-        
-        # 2. Get logical size (e.g., 1440x900)
-        logical_w, logical_h = pyautogui.size()
-        
+
         with Image.open(file_path) as img:
-            # 3. Downsample to logical size for 1:1 mapping
-            # This makes the "Vision" identical to the "Execution" space.
-            resized_img = img.resize((logical_w, logical_h), Image.Resampling.LANCZOS)
+            native_w, native_h = img.size
+
+            # 2. Downsample to the fixed logical canvas (what Nova sees).
+            resized_img = img.resize(
+                (LOGICAL_CANVAS_WIDTH, LOGICAL_CANVAS_HEIGHT),
+                Image.Resampling.LANCZOS,
+            )
             
             buf = io.BytesIO()
             resized_img.convert("RGB").save(buf, format="JPEG", quality=85)
             b64_img = base64.b64encode(buf.getvalue()).decode('utf-8')
             
-        logging.info(f"CAPTURED: Physical={img.size}, Resized to Logical={logical_w}x{logical_h}")
+        logging.info(
+            "CAPTURED: Native=%sx%s, Canvas=%sx%s",
+            native_w,
+            native_h,
+            LOGICAL_CANVAS_WIDTH,
+            LOGICAL_CANVAS_HEIGHT,
+        )
         return {
             "image_base64": b64_img,
-            "width": logical_w,
-            "height": logical_h
+            "width": LOGICAL_CANVAS_WIDTH,
+            "height": LOGICAL_CANVAS_HEIGHT
         }
     except Exception as e:
         logging.error(f"Native capture failed: {e}")
         return {"error": str(e)}
 
 def perform_click_sync(x: int, y: int):
-    """Click with 1:1 mapping (Resized capture ensures brain coords == logical coords)."""
+    """
+    Clicks at a point chosen on the fixed 1440x900 canvas.
+
+    The model outputs normalized coordinates in [0, 1000] for both X and Y,
+    where (0,0) is top-left and (1000,1000) is bottom-right. We map those
+    directly into whatever coordinate space PyAutoGUI reports
+    (logical or physical) so it “just works” on this M1 MacBook Pro.
+    """
     try:
-        # No scaling needed! Resize to logical resolution on capture
-        # ensures brain's (x, y) is already in PyAutoGUI's space.
-        logging.warning(f"COORD 1:1 DEBUG: Brain=({x}, {y}), Clicking={x}, {y}")
-        
-        pyautogui.moveTo(x, y, duration=0.1)
+        screen_w, screen_h = pyautogui.size()
+
+        # Interpret x, y as normalized [0, 1000] coordinates.
+        nx = max(0.0, min(1000.0, float(x)))
+        ny = max(0.0, min(1000.0, float(y)))
+
+        click_x = int(max(0, min(screen_w - 1, round((nx / 1000.0) * (screen_w - 1)))))
+        click_y = int(max(0, min(screen_h - 1, round((ny / 1000.0) * (screen_h - 1)))))
+
+        logging.warning(
+            "CLICK DEBUG: Brain(norm)=(%s,%s) -> Click=(%s,%s) | screen=%sx%s",
+            x,
+            y,
+            click_x,
+            click_y,
+            screen_w,
+            screen_h,
+        )
+
+        pyautogui.moveTo(click_x, click_y, duration=0.1)
         pyautogui.click()
         
     except Exception as e:

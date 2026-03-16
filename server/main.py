@@ -32,9 +32,9 @@ nova_client = OpenAI(
 )
 
 NOVA_LITE_MODEL_ID = "nova-2-lite-v1"
-NOVA_PRO_MODEL_ID = "nova-2-pro-v1"
+NOVA_PRO_MODEL_ID = "nova-pro-v1"
 
-MAX_AGENT_STEPS = 10
+MAX_AGENT_STEPS = 25
 ACTION_SETTLE_TIME = 2.0  # seconds to wait after an action for the UI to update
 SCREENSHOT_TIMEOUT = 5.0  # seconds to wait for a screenshot from client
 
@@ -69,23 +69,30 @@ def annotate_screenshot(image_b64: str, last_action: dict = None) -> str:
         
         TICK_LEN = 12       # length of ruler tick marks in pixels
         LABEL_PAD = 2       # padding between tick and label text
-        STEP = 200          # ruler interval in pixels
+        # We draw ticks at 0–1000 normalized coordinates mapped along each edge
+        # so they match the model's coordinate system.
+        NUM_STEPS = 5       # 0, 200, 400, 600, 800, 1000
         TICK_COLOR = (255, 60, 60)  # red ticks
         LABEL_COLOR = (255, 255, 255)  # white labels for readability
         
-        # --- Top edge ruler (X-axis) ---
-        for x in range(0, w, STEP):
-            if x == 0:
+        step_norm = 1000 // NUM_STEPS
+        # --- Top edge ruler (X-axis, 0–1000) ---
+        for i in range(0, NUM_STEPS + 1):
+            norm = i * step_norm
+            x = int(round((norm / 1000) * w))
+            if i == 0:
                 continue  # skip origin to avoid overlap
             draw.line([(x, 0), (x, TICK_LEN)], fill=TICK_COLOR, width=2)
-            draw.text((x + LABEL_PAD, LABEL_PAD), str(x), fill=LABEL_COLOR, font=font)
+            draw.text((x + LABEL_PAD, LABEL_PAD), str(norm), fill=LABEL_COLOR, font=font)
         
-        # --- Left edge ruler (Y-axis) ---
-        for y in range(0, h, STEP):
-            if y == 0:
+        # --- Left edge ruler (Y-axis, 0–1000) ---
+        for i in range(0, NUM_STEPS + 1):
+            norm = i * step_norm
+            y = int(round((norm / 1000) * h))
+            if i == 0:
                 continue
             draw.line([(0, y), (TICK_LEN, y)], fill=TICK_COLOR, width=2)
-            draw.text((LABEL_PAD, y + LABEL_PAD), str(y), fill=LABEL_COLOR, font=font)
+            draw.text((LABEL_PAD, y + LABEL_PAD), str(norm), fill=LABEL_COLOR, font=font)
         
         # --- Last-click crosshair (debug feedback) ---
         if last_action and last_action.get("command") == "click":
@@ -145,9 +152,13 @@ async def websocket_endpoint(websocket: WebSocket):
         async def hybrid_reasoning(user_text, latest_sight, latest_image_b64):
             """Routes task to Nova Lite (simple/routing) or Nova Pro (advanced + vision)."""
             routing_prompt = f"""You are the Task Router for Sai, a macOS assistant. 
-Determine if the task is SIMPLE (one-off action like "Open Safari", "Type hello") 
-or ADVANCED (complex, multi-step, visual analysis needed, or research/answering questions).
+Determine if the task is SIMPLE or ADVANCED.
+- SIMPLE: A single, one-off action that requires NO visual feedback or navigation. 
+  Examples: "Open Chrome", "Type hello world", "Maximize this window".
+- ADVANCED: Any task involving multiple steps, specific URLs (e.g. amazon.com, google.com), visual search, research, or answering questions. 
+  Examples: "Open amazon.com on Safari", "Search for physics notes", "Click the red button", "Answer my concept check questions".
 User said: "{user_text}"
+If the user mentions a specific website, URL, or a task with logic, it is ADVANCED.
 Output JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
             try:
                 response = nova_client.chat.completions.create(
@@ -174,7 +185,7 @@ Output JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
                     resp = nova_client.chat.completions.create(
                         model=NOVA_LITE_MODEL_ID,
                         messages=[
-                            {"role": "system", "content": "Convert to tool JSON. Valid commands: type_text (text), open_url (url). e.g. 'Open Safari' -> {\"command\": \"type_text\", \"text\": \"Safari\"}"},
+                            {"role": "system", "content": "Convert to tool JSON. For apps, use: {'command': 'type_text', 'text': 'AppName'}. For URLs, use: {'command': 'open_url', 'url': 'https://...'}. ONLY output JSON."},
                             {"role": "user", "content": user_text}
                         ],
                         temperature=0
@@ -197,7 +208,29 @@ Output JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
 
         async def run_agent_loop(user_text):
             logger.info(f"Starting Agent Loop for task: {user_text}")
-            SENIOR_SYSTEM_PROMPT = "You control macOS via screenshots. Tools: open_url, click(x,y), keyboard_type, type_text, wait, press_hotkey, scroll. Output JSON: {'explanation': '...', 'command': '...', 'done': bool}"
+            SENIOR_SYSTEM_PROMPT = """You are the Senior Vision Specialist for Sai.
+Resolution: The image you see is the full macOS screen, but you MUST reason in a normalized 2D coordinate system:
+- X and Y are always in the range [0, 1000], where:
+  - (0, 0) is the top-left corner of the visible screen
+  - (1000, 1000) is the bottom-right corner of the visible screen
+When you output a click at the visual center, use approximately (500, 500).
+The client maps these normalized coordinates directly into the real screen coordinate space.
+
+You MUST be agentic:
+- Do ONE action per step (or "wait" if needed).
+- After an action, you MUST request another screenshot and VERIFY the result before declaring completion.
+- Only set done=true when the screenshot CONFIRMS the task is complete. Do not guess.
+
+Output ONLY JSON: {"explanation": "...", "command": "...", "x": number, "y": number, "done": bool}
+
+SUPPORTED COMMANDS:
+- {"command": "open_url", "url": "https://..."}
+- {"command": "click", "x": number (0-1000), "y": number (0-1000)}
+- {"command": "type_text", "text": "App Name"}
+- {"command": "keyboard_type", "text": "string"}
+- {"command": "press_hotkey", "keys": ["command", "c"]}
+- {"command": "scroll", "amount": number}
+- {"command": "wait"}"""
             conversation_history = [{"role": "system", "content": SENIOR_SYSTEM_PROMPT}]
             last_action = None
             
@@ -238,6 +271,7 @@ Output JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
                         temperature=0.2
                     )
                     raw_content = response.choices[0].message.content
+                    logger.info(f"Agent raw response: {raw_content[:200]}...")
                     conversation_history.append({"role": "assistant", "content": raw_content})
                     
                     data = extract_json(raw_content)
@@ -245,17 +279,31 @@ Output JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
                         logger.error(f"Agent failed to produce JSON: {raw_content}")
                         break
 
+                    logger.info(f"Agent parsed data: {data}")
                     cmd = data.get("command")
-                    if cmd and cmd != "none":
+                    performed_action = False
+                    # Only forward actual tool commands to the client.
+                    if cmd in {"open_url", "click", "type_text", "keyboard_type", "press_hotkey", "scroll", "wait"}:
                         last_action = data
+                        logger.info(f"Sending command to client: {cmd}")
                         await websocket.send_text(json.dumps(data))
                         await asyncio.sleep(ACTION_SETTLE_TIME)
-                    if data.get("done"): break
+                        performed_action = True
+                        
+                    # Guardrail: never allow "done" on the same step we performed an action.
+                    # We always require at least one follow-up screenshot to verify completion.
+                    if data.get("done") and performed_action:
+                        logger.info("Agent requested done immediately after action; forcing verification step.")
+                        data["done"] = False
+
+                    if data.get("done"):
+                        logger.info("Agent signaled completion (done=True).")
+                        break
                     
                     connection_state["screenshot_event"].clear()
                     await websocket.send_text(json.dumps({"command": "capture_screen"}))
                     await asyncio.wait_for(connection_state["screenshot_event"].wait(), timeout=SCREENSHOT_TIMEOUT)
-            except Exception as e: logger.error(f"Agent error: {e}")
+            except Exception as e: logger.error(f"Agent error in run_agent_loop: {e}")
 
         async def process_complete_transcription():
             if connection_state["command_triggered"]: return
@@ -323,11 +371,16 @@ Output JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
 
             try:
                 while True:
-                    if connection_state["command_triggered"]:
-                        # If a one-shot command was triggered, we stop receiving and let the session close
-                        break
+                    # We no longer break on command_triggered here.
+                    # This loop must stay alive to receive 'screen_captured' events
+                    # while the one-shot agent task is running.
+                    # It will exit naturally when websocket.close() is called or the client disconnects.
                         
-                    message = await websocket.receive()
+                    try:
+                        message = await websocket.receive()
+                    except RuntimeError:
+                        # Session closed by one-shot handler or client
+                        break
                     if message.get("bytes"):
                         await dg_socket.send_media(message.get("bytes"))
                     elif message.get("text"):
