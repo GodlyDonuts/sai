@@ -1,124 +1,86 @@
-# 🪐 Sai: The Universal Multimodal OS Agent
+# 🪐 Sai: The Visual OS Co-Pilot
 
-**The keyboard is dead. The mouse is dead. Welcome to the Zero-Click Web.**
-
-> **Award Targets:** Best of UI Navigators Grand Prize
-> **Built for:** The 2026 Gemini Live Agent Challenge
+**The keyboard is optional. The mouse is agentic. Welcome to the High-Precision OS Agent.**
 
 ---
 
 ## 👁️ The Vision
 
-For the past decade, we have relied on brittle APIs and hard-coded RPA bots to automate our digital lives. When a company changes their UI, the automation breaks. Furthermore, voice assistants are entirely blind—they can tell you the weather, but they cannot *see* the complex software in front of you.
+Most voice assistants are blind—they can tell you the weather, but they can't see the complex UI in front of you. **Sai** is a fundamental paradigm shift. It combines real-time audio transcription with multimodal visual perception to operate your computer exactly like a human would.
 
-**Sai** is a fundamental paradigm shift. We are combining the real-time, interruptible conversation of the **Live Agent** track with the visual perception and physical execution of the **UI Navigator** track.
-
-Sai does not use a single integration or API to interact with third-party software. It uses **Gemini 3.1 Pro’s advanced multimodal and agentic reasoning** alongside the **Google Agent Development Kit (ADK)** to look at your screen, listen to your voice, and operate your computer exactly like a human would.
-
----
-
-## 🧠 What is Sai?
-
-Sai is an OS-level, voice-native cybernetic co-pilot. You do not type prompts into a text box. You simply sit back, look at your monitor, and speak natively to your computer.
-
-**Example Interaction:**
-
-> **User:** *"Sai, I'm out of laundry detergent. Get me some Tide Pods on Amazon."* > *(Sai takes over the mouse, opens a new tab, navigates to Amazon, locates the search bar visually, and types 'Tide Pods'.)* > **User (Interrupting):** *"Wait, Sai, actually change that to the liquid detergent, not the pods."* > *(Sai instantly halts the current action trajectory, listens to the new constraint, deletes 'pods' from the search bar, types 'liquid', and proceeds to checkout.)*
-
----
-
-## ✨ Core Disruptive Features
-
-1. **True "Zero-API" UI Navigation:** Powered by Gemini 3.1 Pro's state-of-the-art visual understanding, Sai dynamically maps the DOM and pixels of any interface in real-time. It beats CAPTCHAs, bypasses anti-bot measures, and navigates "Dark Patterns" because it acts visually, not programmatically.
-2. **Full-Duplex Interruption Architecture:** Utilizing the Gemini Live API via WebSockets, Sai’s cognitive loop can be interrupted mid-action. If you see the mouse moving toward the wrong button, you simply say "Stop," and the agent immediately halts and awaits redirection.
-3. **Google Antigravity Orchestration:** We leverage Google's new agentic development platform, Antigravity, to manage Sai's memory, tool-calling state, and task trajectory across long-horizon OS operations.
-4. **Transparent Thought Stream:** Sai features an elegant UI overlay that exposes its "internal monologue" (e.g., `[Vision: Target is Amazon checkout. Audio: User requested 2-day shipping. Action: Locating Prime toggle at X:450, Y:820]`), proving to users (and judges) exactly how the multimodal reasoning is occurring.
+Sai doesn't use brittle APIs or hard-coded selectors. It uses **Amazon Nova Vision's advanced multimodal reasoning** to look at your screen, listen to your voice, and execute OS-level commands with pixel-perfect accuracy.
 
 ---
 
 ## 🏗️ Architecture & Technical Stack
 
-To solve the "Stop-and-Go" problem of multimodal agents (where the agent pauses to think, ruining the UX), Sai utilizes a **Dual-Loop Cognitive Architecture** hosted entirely on Google Cloud.
+Sai utilizes a **Hybrid Multi-Model Architecture** to balance speech speed with visual reasoning depth.
 
 ### The Stack
 
-* **The Brain (Orchestration):** Gemini 3.1 Pro (via Google AI Studio / Vertex AI) & Google Antigravity.
-* **The Ears (Audio IO):** Gemini Live API (Native WebSocket audio streaming, bypassing legacy ASR/TTS pipelines).
-* **The Hands (Execution):** Local Desktop Client (Python/Rust) running OS-level accessibility APIs and PyAutoGUI for precise X/Y coordinate mouse/keyboard execution.
-* **The Infrastructure:** Google Cloud Run (Backend hosting), Cloud Tasks (Queueing), and Firebase (Real-time telemetry and state management).
+*   **The Ears (ASR):** Deepgram Nova-2 (WebSocket streaming for ultra-low latency transcription).
+*   **The Router:** Amazon Nova Lite (Quickly determines if a task is SIMPLE or ADVANCED).
+*   **The Brain (Vision):** Amazon Nova Pro (Multimodal reasoning over 1440x900 canonical screenshots).
+*   **The Hands (Execution):** Local Desktop Client (Python) using PyAutoGUI for resolution-independent coordinate execution.
 
 ### The Dual-Loop System
 
-1. **The Fast Loop (The Live Agent):** A continuous WebSocket connection between the user's microphone/speaker and the Gemini Live API. This loop maintains the conversational persona, handles user interruptions, and determines *intent*.
-2. **The Slow Loop (The UI Navigator):** When the Fast Loop detects a UI intent (e.g., "click the checkout button"), it triggers the Slow Loop. A screenshot of the active OS window is captured, compressed, and sent to **Gemini 3.1 Pro** with a specialized prompt to extract the exact `[X, Y]` coordinates of the requested semantic element.
-3. **The Proxy Tool Hand-off:** Using ADK, the cloud-based Gemini model issues a tool call (e.g., `execute_click(x, y)`). A callback intercepts this in Google Cloud, serializes it over a secure WebSocket to the local desktop client, and executes the physical mouse movement instantly.
-
-![Architecture Diagram Placeholder - *To be uploaded to repo*]
+1.  **The Routing Loop:** As you speak, Deepgram streams text to the server. Nova Lite immediately classifies the intent. 
+    - **SIMPLE** tasks (e.g., "Open Safari") execute instantly.
+    - **ADVANCED** tasks trigger the full Vision Agent loop.
+2.  **The Vision Agent Loop:** 
+    - A screenshot is captured and normalized to a **1440x900 Vision Canvas**.
+    - Red ruler ticks are drawn on the image at `[0, 200, 400, 600, 800, 1000]` for spatial reference.
+    - **Nova Pro** reasons in a normalized `[0, 1000]` coordinate space.
+    - After every action, a follow-up screenshot is captured to **VERIFY** the result before proceeding or finishing.
 
 ---
 
-## 🚀 Setup & Reproducibility (For Judges)
+## ✨ Key Features
+
+- **Resolution-Independent Coordinates**: By reasoning in a normalized `0-1000` grid, Sai works perfectly on 14" Retina displays, 4K monitors, and everything in between.
+- **One-Shot Interaction**: Sai listens for the "Sai" wake-word, processes exactly one command, and then immediately returns to its offline, low-power listening state.
+- **Agentic Verification**: Unlike older bots that "fire and forget", Sai looks at the screen *after* a click to confirm the UI changed as expected. If it missed, it re-calibrates and tries again.
+- **Spotlight Integration**: High-speed application launching via macOS Spotlight.
+
+---
+
+## 🚀 Setup & Reproducibility
 
 ### Prerequisites
 
-* Python 3.11+
-* Google Cloud Platform Account (with Billing Enabled for Gemini 3.1 Pro / Vertex AI)
-* Google GenAI SDK & ADK installed
+*   Python 3.11+
+*   Picovoice Access Key (for "Sai" wake word)
+*   Deepgram API Key (for transcription)
+*   Amazon Nova API Key (via OpenAI-compatible proxy)
 
-### 1. Cloud Infrastructure Deployment
-
-We use Infrastructure-as-Code to make deployment one-click.
-
+### 1. Server Setup
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/sai-agent.git
-cd sai-agent/cloud-backend
-
-# Authenticate with Google Cloud
-gcloud auth login
-gcloud config set project [YOUR_PROJECT_ID]
-
-# Deploy the Gemini Live API & Orchestration Backend to Cloud Run
-gcloud run deploy sai-orchestrator \
-  --source . \
-  --region us-central1 \
-  --set-env-vars="GEMINI_API_KEY=your_key,PROJECT_ID=your_project" \
-  --allow-unauthenticated
-
+cd server
+pip install -r requirements.txt
+# Configure .env with NOVA_BASE_URL, DEEPGRAM_API_KEY, etc.
+uvicorn main:app --host 0.0.0.0 --port 8080
 ```
 
-*Note: The deployment logs and Cloud Run dashboard view are included in our `proof_of_cloud.mp4` submission.*
-
-### 2. Local Client Execution
-
-Once the cloud backend is live, run the local eyes and ears (wake word detection and audio streaming):
-
+### 2. Client Setup
 ```bash
 cd client
 pip install -r requirements.txt
-
-# Start the wake word detector and audio streamer
 python wake_word.py
 ```
 
-*Note: The script expects a `.env` file with your `PICOVOICE_ACCESS_KEY` and the `HeySai_mac.ppn` model file in the `client/` directory.*
-
 ---
 
-## 🧪 The "Do Anything" Hackathon Demos
+## 🧪 The "High Precision" Demo
 
-We didn't build toy examples. In our submission video, you will see Sai execute the following flawlessly:
-
-1. **The Commerce Run:** Ordering a physical product from an unstructured e-commerce site entirely via voice, including handling a mid-checkout voice interruption to change the shipping address.
-2. **The Subscription Guillotine:** Pointing Sai at a notoriously difficult "Dark Pattern" gym cancellation portal. Sai visually identifies the guilt-trip UI, ignores the massive green "Keep Membership" button, and successfully clicks the low-contrast, hidden "Confirm Cancellation" text.
-3. **Cross-App Data Synthesis:** "Sai, look at my open email, find the competitor pricing PDF attached, open it, and draft a Slack message to the sales team summarizing how we beat them."
+Sai can navigate complex web-based quizzes, order products, and synthesize data across apps. Its strength lies in its ability to **visually identify** buttons and text fields based on semantic context, not just DOM structure.
 
 ---
 
 ## 🏆 Why Sai Wins
 
-* **Maximum Innovation (40%):** We completely shatter the "text box" paradigm. This isn't a chatbot; it's a multimodal entity that commands the user's operating system.
-* **Technical Excellence (30%):** We push the absolute limits of the newly released **Gemini 3.1 Pro** and its native agentic reasoning, overcoming latency issues by decoupling the audio-conversational loop from the visual-execution loop.
-* **Zero Mockups:** Every pixel of mouse movement in our 4-minute demo is genuinely generated by the model's visual understanding of the screen in real-time.
+*   **Maximum Innovation**: We completely shatter the "text box" paradigm. This isn't a chatbot; it's a multimodal entity that commands the user's operating system.
+*   **Technical Excellence**: We push the absolute limits of the newly released **Amazon Nova** and its native agentic reasoning, overcoming latency issues by decoupling the audio-conversational loop from the visual-execution loop.
+*   **Zero Mockups**: Every pixel of mouse movement is genuinely generated by the model's visual understanding of the screen in real-time.
 
 **Stop typing. Start speaking. Sai is the future of human-computer interaction.**

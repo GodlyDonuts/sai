@@ -25,14 +25,22 @@ app = FastAPI(title="Sai OS Agent Cloud Backend (Nova + Deepgram)")
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
-# Nova Setup via OpenAI Proxy
+# Nova Setup
+# Lite model stays on Amazon Nova endpoint
 nova_client = OpenAI(
     api_key=os.getenv("AMAZON_NOVA_API_KEY"),
     base_url=os.getenv("NOVA_BASE_URL", "https://api.nova.amazon.com/v1")
 )
 
 NOVA_LITE_MODEL_ID = "nova-2-lite-v1"
-NOVA_PRO_MODEL_ID = "nova-pro-v1"
+
+# Pro model routes through OpenRouter to avoid Amazon RPM limits
+nova_pro_client = OpenAI(
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+)
+
+NOVA_PRO_MODEL_ID = "amazon/nova-pro-v1"
 
 MAX_AGENT_STEPS = 25
 ACTION_SETTLE_TIME = 2.0  # seconds to wait after an action for the UI to update
@@ -123,6 +131,7 @@ async def websocket_endpoint(websocket: WebSocket):
     connection_state = {
         "latest_sight": "No visual context yet.",
         "latest_screenshot_b64": None,
+        "latest_app_context": {},
         "transcription_buffer": [],
         "debounce_task": None,
         "active_agent_task": None,
@@ -148,18 +157,48 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close(code=1003)
             return
 
-        # Define reasoning inside so it has access to websocket and state
+        def _build_app_context_summary() -> str:
+            """Summarize what the user currently has on screen."""
+            ctx = connection_state.get("latest_app_context", {})
+            app = ctx.get("app_name", "")
+            url = ctx.get("tab_url", "")
+            title = ctx.get("tab_title", "")
+            if not app:
+                return "No active app information available."
+            parts = [f"Active app: {app}"]
+            if url:
+                parts.append(f"Browser tab URL: {url}")
+            if title:
+                parts.append(f"Tab title: {title}")
+            return " | ".join(parts)
+
         async def hybrid_reasoning(user_text, latest_sight, latest_image_b64):
-            """Routes task to Nova Lite (simple/routing) or Nova Pro (advanced + vision)."""
-            routing_prompt = f"""You are the Task Router for Sai, a macOS assistant. 
-Determine if the task is SIMPLE or ADVANCED.
-- SIMPLE: A single, one-off action that requires NO visual feedback or navigation. 
-  Examples: "Open Chrome", "Type hello world", "Maximize this window".
-- ADVANCED: Any task involving multiple steps, specific URLs (e.g. amazon.com, google.com), visual search, research, or answering questions. 
-  Examples: "Open amazon.com on Safari", "Search for physics notes", "Click the red button", "Answer my concept check questions".
+            """Routes task to Nova Lite (simple/launch) or Nova Pro (advanced vision agent)."""
+            app_ctx_summary = _build_app_context_summary()
+
+            routing_prompt = f"""You are the Task Router for Sai, a macOS desktop assistant.
+Your job: decide if the user's request is SIMPLE or ADVANCED.
+
+CURRENT SCREEN CONTEXT:
+{app_ctx_summary}
+
+RULES:
+- SIMPLE means a single fire-and-forget action that does NOT need to see the screen:
+  • Launching an app ("Open Chrome", "Open Spotify")
+  • Opening a brand-new URL that the user is NOT already on
+  • A single global hotkey ("Maximize this window", "Take a screenshot")
+- ADVANCED means ANYTHING that requires looking at the screen, navigating UI, clicking elements, or interacting with content that is already visible:
+  • Any task involving a website or app the user is ALREADY on (e.g. they're on twitter.com and say "turn off data sharing")
+  • Any multi-step workflow, settings navigation, form filling, reading content
+  • Any task mentioning a specific site/service when the user is ALREADY on that site
+  • Searching within a page, scrolling, clicking buttons, toggling settings
+  • Answering questions about what's on screen
+
+CRITICAL: If the user's request relates to the app or website they currently have open, it is ALWAYS ADVANCED — the agent must use the existing screen, NOT launch a new app or open Spotlight.
+
 User said: "{user_text}"
-If the user mentions a specific website, URL, or a task with logic, it is ADVANCED.
-Output JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
+
+Output JSON: {{"complexity": "SIMPLE" | "ADVANCED", "reason": "one sentence why"}}"""
             try:
                 response = nova_client.chat.completions.create(
                     model=NOVA_LITE_MODEL_ID,
@@ -175,17 +214,31 @@ Output JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
                     raise ValueError(f"No JSON found in routing response: {raw_routing}")
                 
                 complexity = routing_data.get("complexity", "SIMPLE").upper()
-                logger.info(f"Routing logic (Nova Lite): {complexity}")
+                reason = routing_data.get("reason", "")
+                logger.info(f"Routing decision: {complexity} | Reason: {reason} | Screen: {app_ctx_summary}")
             except Exception as e: 
-                logger.error(f"Routing failed, defaulting to SIMPLE: {e}")
-                complexity = "SIMPLE"
+                logger.error(f"Routing failed, defaulting to ADVANCED for safety: {e}")
+                complexity = "ADVANCED"
 
             if complexity == "SIMPLE":
                 try:
                     resp = nova_client.chat.completions.create(
                         model=NOVA_LITE_MODEL_ID,
                         messages=[
-                            {"role": "system", "content": "Convert to tool JSON. For apps, use: {'command': 'type_text', 'text': 'AppName'}. For URLs, use: {'command': 'open_url', 'url': 'https://...'}. ONLY output JSON."},
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Convert the user's request to a SINGLE tool-call JSON.\n"
+                                    "AVAILABLE COMMANDS:\n"
+                                    "- Launch an app via Spotlight: {\"command\": \"type_text\", \"text\": \"AppName\"}\n"
+                                    "- Open a URL in the browser: {\"command\": \"open_url\", \"url\": \"https://...\"}\n"
+                                    "- Press a hotkey: {\"command\": \"press_hotkey\", \"keys\": [\"command\", \"n\"]}\n"
+                                    "RULES:\n"
+                                    "- type_text is ONLY for launching apps via Spotlight. NEVER use it to interact with on-screen content.\n"
+                                    "- If the task requires interacting with what's already on screen, output: {\"command\": \"escalate\"}\n"
+                                    "ONLY output JSON."
+                                )
+                            },
                             {"role": "user", "content": user_text}
                         ],
                         temperature=0
@@ -195,21 +248,37 @@ Output JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
                     if not result:
                         raise ValueError(f"No JSON found in simple generation: {raw_simple}")
                     
-                    logger.info(f"SIMPLE action generated: {result}")
-                    return result
+                    if result.get("command") == "escalate":
+                        logger.info("SIMPLE handler escalated to ADVANCED agent loop.")
+                        complexity = "ADVANCED"
+                    else:
+                        logger.info(f"SIMPLE action generated: {result}")
+                        return result
                 except Exception as e:
-                    logger.error(f"SIMPLE generation failed: {e}")
-                    return None
-            else:
-                if connection_state["active_agent_task"] and not connection_state["active_agent_task"].done():
-                    connection_state["active_agent_task"].cancel()
-                connection_state["active_agent_task"] = asyncio.create_task(run_agent_loop(user_text))
-                return None
+                    logger.error(f"SIMPLE generation failed, escalating to ADVANCED: {e}")
+                    complexity = "ADVANCED"
+
+            # ADVANCED path
+            if connection_state["active_agent_task"] and not connection_state["active_agent_task"].done():
+                connection_state["active_agent_task"].cancel()
+            connection_state["active_agent_task"] = asyncio.create_task(run_agent_loop(user_text))
+            return None
 
         async def run_agent_loop(user_text):
             logger.info(f"Starting Agent Loop for task: {user_text}")
-            SENIOR_SYSTEM_PROMPT = """You are the Senior Vision Specialist for Sai.
-Resolution: The image you see is the full macOS screen, but you MUST reason in a normalized 2D coordinate system:
+            app_ctx_summary = _build_app_context_summary()
+            SENIOR_SYSTEM_PROMPT = f"""You are the Senior Vision Specialist for Sai, a macOS desktop agent.
+
+CURRENT SCREEN CONTEXT:
+{app_ctx_summary}
+
+CRITICAL RULE — WORK WITH WHAT IS ON SCREEN:
+- The user has asked you to perform a task. Look at the screenshot to understand what is currently visible.
+- If the relevant app or website is ALREADY open, work directly within it. Do NOT open Spotlight, do NOT launch a new browser, do NOT navigate away unless the task explicitly requires it.
+- NEVER use type_text (Spotlight) when the target app/site is already the frontmost window. Instead, click on UI elements, scroll, or use hotkeys to navigate within the existing app.
+- If you need to navigate to a different page within the current browser, use the address bar (Command+L) or click links — do NOT open a new browser window via Spotlight.
+
+Resolution: The image you see is the full macOS screen in a normalized 2D coordinate system:
 - X and Y are always in the range [0, 1000], where:
   - (0, 0) is the top-left corner of the visible screen
   - (1000, 1000) is the bottom-right corner of the visible screen
@@ -219,18 +288,24 @@ The client maps these normalized coordinates directly into the real screen coord
 You MUST be agentic:
 - Do ONE action per step (or "wait" if needed).
 - After an action, you MUST request another screenshot and VERIFY the result before declaring completion.
-- Only set done=true when the screenshot CONFIRMS the task is complete. Do not guess.
+- Only set done=true when the screenshot CONFIRMS the task is complete. Do not guess. Always take one more screenshot after an action to verify the result.
 
-Output ONLY JSON: {"explanation": "...", "command": "...", "x": number, "y": number, "done": bool}
+TEXT ENTRY RULES (VERY IMPORTANT):
+- When you need to type into a text field, search bar, or form on screen, use {{"command": "keyboard_type", "text": "..."}}.
+- type_text is ONLY for launching apps via Spotlight. Do NOT use it for anything else.
+- NEVER rely on the clipboard. Do NOT use paste hotkeys such as Command+V / Cmd+V to input text.
+- You may still use other hotkeys for navigation (e.g., Command+L to focus the URL bar, Command+T to open a new tab), but not for pasting content.
+
+Output ONLY JSON: {{"explanation": "...", "command": "...", "x": number, "y": number, "done": bool}}
 
 SUPPORTED COMMANDS:
-- {"command": "open_url", "url": "https://..."}
-- {"command": "click", "x": number (0-1000), "y": number (0-1000)}
-- {"command": "type_text", "text": "App Name"}
-- {"command": "keyboard_type", "text": "string"}
-- {"command": "press_hotkey", "keys": ["command", "c"]}
-- {"command": "scroll", "amount": number}
-- {"command": "wait"}"""
+- {{"command": "open_url", "url": "https://..."}}
+- {{"command": "click", "x": number (0-1000), "y": number (0-1000)}}
+- {{"command": "type_text", "text": "App Name"}} (ONLY for launching apps via Spotlight)
+- {{"command": "keyboard_type", "text": "string"}} (for typing into on-screen fields)
+- {{"command": "press_hotkey", "keys": ["command", "c"]}}
+- {{"command": "scroll", "amount": number (0-100)}}
+- {{"command": "wait"}}"""
             conversation_history = [{"role": "system", "content": SENIOR_SYSTEM_PROMPT}]
             last_action = None
             
@@ -265,7 +340,7 @@ SUPPORTED COMMANDS:
                     ]
                     conversation_history.append({"role": "user", "content": user_content})
                     
-                    response = nova_client.chat.completions.create(
+                    response = nova_pro_client.chat.completions.create(
                         model=NOVA_PRO_MODEL_ID,
                         messages=conversation_history,
                         temperature=0.2
@@ -316,18 +391,29 @@ SUPPORTED COMMANDS:
             
             # Cancel any pending debounce
             if connection_state["debounce_task"]: connection_state["debounce_task"].cancel()
-            
-            action = await hybrid_reasoning(full_text, connection_state["latest_sight"], connection_state["latest_screenshot_b64"])
-            if action: await websocket.send_text(json.dumps(action))
-            
-            # Wait for agent loop if it was started
-            if connection_state["active_agent_task"]:
-                try: await connection_state["active_agent_task"]
-                except asyncio.CancelledError: pass
-            
-            # Finalize session to return to wake-word mode
-            logger.info("One-shot command complete. Closing session.")
-            await websocket.close()
+
+            try:
+                await websocket.send_text(json.dumps({"command": "set_activity", "state": "active"}))
+            except Exception as e:
+                logger.warning(f"Failed to send activity start: {e}")
+
+            try:
+                action = await hybrid_reasoning(full_text, connection_state["latest_sight"], connection_state["latest_screenshot_b64"])
+                if action: await websocket.send_text(json.dumps(action))
+                
+                # Wait for agent loop if it was started
+                if connection_state["active_agent_task"]:
+                    try: await connection_state["active_agent_task"]
+                    except asyncio.CancelledError: pass
+            finally:
+                try:
+                    await websocket.send_text(json.dumps({"command": "set_activity", "state": "idle"}))
+                except Exception as e:
+                    logger.warning(f"Failed to send activity stop: {e}")
+                
+                # Finalize session to return to wake-word mode
+                logger.info("One-shot command complete. Closing session.")
+                await websocket.close()
 
         async def debounce_and_process():
             await asyncio.sleep(1.5)
@@ -387,6 +473,7 @@ SUPPORTED COMMANDS:
                         data = json.loads(message["text"])
                         if data.get("event") == "screen_captured":
                             connection_state["latest_screenshot_b64"] = data.get("image_base64")
+                            connection_state["latest_app_context"] = data.get("app_context", {})
                             connection_state["screenshot_event"].set()
             except WebSocketDisconnect:
                 logger.info("Client disconnected")
