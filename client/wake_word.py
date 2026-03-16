@@ -486,17 +486,9 @@ def perform_type_sync(text: str):
 def perform_keyboard_type_sync(text: str):
     """Types text directly into the currently focused field using clipboard paste (reliable on macOS)."""
     import subprocess
-    # Handle newlines as Enter keypresses
-    parts = text.split("\n")
-    for i, part in enumerate(parts):
-        if part:
-            # Copy to clipboard and paste — much more reliable than pyautogui.write on macOS
-            process = subprocess.run(["pbcopy"], input=part.encode("utf-8"), capture_output=True)
-            pyautogui.hotkey("command", "v")
-            time.sleep(0.1)
-        if i < len(parts) - 1:
-            pyautogui.press("enter")
-            time.sleep(0.1)
+    subprocess.run(["pbcopy"], input=text.encode("utf-8"), capture_output=True)
+    pyautogui.hotkey("command", "v")
+    time.sleep(0.15)
 
 def perform_hotkey_sync(keys: list):
     """Presses a combination of keys together (e.g., ['command', 'n'])."""

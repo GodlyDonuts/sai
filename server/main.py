@@ -538,7 +538,10 @@ SUPPORTED COMMANDS:
                     connection_state["screenshot_event"].clear()
                     await websocket.send_text(json.dumps({"command": "capture_screen"}))
                     await asyncio.wait_for(connection_state["screenshot_event"].wait(), timeout=SCREENSHOT_TIMEOUT)
-            except Exception as e: logger.error(f"Agent error in run_agent_loop: {e}")
+            except asyncio.TimeoutError:
+                logger.error("Agent error in run_agent_loop: timed out waiting for screenshot from client")
+            except Exception as e:
+                logger.error(f"Agent error in run_agent_loop: {type(e).__name__}: {e}")
 
         async def process_complete_transcription():
             if connection_state["command_triggered"]: return
