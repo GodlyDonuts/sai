@@ -4,5 +4,4 @@ websockets
 python-dotenv
 openai
 Pillow
-deepgram-sdk
 boto3

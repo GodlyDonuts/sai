@@ -35,6 +35,7 @@ try:
             NSColor,
             NSMakeRect,
             NSObject,
+            NSFloatingWindowLevel,
             NSPanel,
             NSScreen,
             NSScreenSaverWindowLevel,
@@ -230,8 +231,8 @@ class ActivityOverlay:
                 if not self._active or self._suspended:
                     return
                 bounds = self.bounds()
-                inset = 10.0
-                corner = 18.0
+                inset = 12.0
+                corner = 20.0
                 path_rect = NSMakeRect(
                     bounds.origin.x + inset,
                     bounds.origin.y + inset,
@@ -252,19 +253,26 @@ class ActivityOverlay:
                 )
 
                 # Glow
-                glow = NSColor.colorWithCalibratedRed_green_blue_alpha_(mix[0], mix[1], mix[2], 0.25)
+                glow = NSColor.colorWithCalibratedRed_green_blue_alpha_(mix[0], mix[1], mix[2], 0.28)
                 glow.setStroke()
                 glow_path = path.copy()
-                glow_path.setLineWidth_(12.0)
+                glow_path.setLineWidth_(14.0)
                 glow_path.stroke()
 
                 # Main stroke with dashed motion
                 stroke = NSColor.colorWithCalibratedRed_green_blue_alpha_(mix[0], mix[1], mix[2], 0.95)
                 stroke.setStroke()
-                path.setLineWidth_(6.0 + 1.5 * math.sin(self._phase + 1.3))
+                path.setLineWidth_(7.0 + 1.8 * math.sin(self._phase + 1.3))
                 dash = (14.0, 8.0)
                 path.setLineDash_count_phase_(dash, 2, self._phase * 10.0)
                 path.stroke()
+
+                # Ultra-subtle corners accent
+                corner_glow = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.08)
+                corner_glow.setStroke()
+                corner_path = path.copy()
+                corner_path.setLineWidth_(2.0)
+                corner_path.stroke()
 
         class _NonActivatingPanel(NSPanel):
             def canBecomeKeyWindow(self):
@@ -303,12 +311,16 @@ class ActivityOverlay:
         panel.setBackgroundColor_(NSColor.clearColor())
         panel.setHasShadow_(False)
         panel.setIgnoresMouseEvents_(True)
-        panel.setLevel_(NSScreenSaverWindowLevel)
+        panel.setLevel_(NSFloatingWindowLevel)
         panel.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehaviorFullScreenAuxiliary
             | NSWindowCollectionBehaviorStationary
         )
+        try:
+            panel.setHidesOnDeactivate_(False)
+        except Exception:
+            pass
 
         view = _OverlayView.alloc().initWithFrame_(frame)
         panel.setContentView_(view)
@@ -323,7 +335,7 @@ class ActivityOverlay:
                     if cmd == "active":
                         state["active"] = bool(val)
                         if state["active"]:
-                            panel.orderFrontRegardless_(None)
+                            panel.orderFront_(None)
                         else:
                             panel.orderOut_(None)
                     elif cmd == "suspend":
@@ -335,6 +347,9 @@ class ActivityOverlay:
             except queue.Empty:
                 pass
             view.update_state(state)
+            if state["active"]:
+                panel.orderFront_(None)
+                panel.displayIfNeeded()
 
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             0.05, view, "step:", None, True

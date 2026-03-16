@@ -9,8 +9,7 @@ import typing
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from datetime import datetime
 from openai import OpenAI
-from deepgram import AsyncDeepgramClient
-from deepgram.core.events import EventType
+import websockets as ws_client
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
@@ -21,9 +20,10 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sai-server")
 
-app = FastAPI(title="Sai OS Agent Cloud Backend (Nova + Deepgram)")
+app = FastAPI(title="Sai OS Agent Cloud Backend (Nova + ElevenLabs)")
 
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_STT_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
 # Nova Setup
 # Lite model stays on Amazon Nova endpoint
@@ -139,8 +139,8 @@ async def websocket_endpoint(websocket: WebSocket):
         "screenshot_event": asyncio.Event()
     }
     
-    if not DEEPGRAM_API_KEY:
-        logger.error("DEEPGRAM_API_KEY not found in environment")
+    if not ELEVENLABS_API_KEY:
+        logger.error("ELEVENLABS_API_KEY not found in environment")
         await websocket.close(code=1011)
         return
 
@@ -171,6 +171,52 @@ async def websocket_endpoint(websocket: WebSocket):
             if title:
                 parts.append(f"Tab title: {title}")
             return " | ".join(parts)
+
+        async def interpret_intent(raw_transcription: str) -> str:
+            """Fix garbled speech-to-text by interpreting the user's likely command intent."""
+            app_ctx_summary = _build_app_context_summary()
+            prompt = f"""You are a voice command interpreter for a macOS desktop assistant called Sai.
+The user spoke a command after saying the wake word "Hey Sai". Speech-to-text may have introduced errors.
+Your job: reconstruct the user's ACTUAL INTENDED COMMAND from the (possibly garbled) transcription.
+
+CURRENT SCREEN CONTEXT:
+{app_ctx_summary}
+
+RAW TRANSCRIPTION: "{raw_transcription}"
+
+RULES:
+- The user is giving a COMMAND (an instruction to do something), never making a casual statement.
+- Use the screen context to disambiguate. If the user is on twitter.com and the transcription mentions "twitter" or "sharing", they likely want to change a Twitter setting.
+- Common speech-to-text errors:
+  • "they're not" / "their not" → "turn off"
+  • "they're on" → "turn on"
+  • "clothes" → "close"
+  • "right" → "write"
+  • Homophones and near-homophones are extremely common.
+- Output ONLY the corrected command as a short imperative sentence. No explanation, no JSON, no quotes.
+
+Examples:
+- Raw: "they're not data sharing on twitter" → Turn off data sharing on Twitter
+- Raw: "clothes the window" → Close the window
+- Raw: "open a new tabb" → Open a new tab
+- Raw: "go to read it" → Go to Reddit"""
+
+            try:
+                response = nova_client.chat.completions.create(
+                    model=NOVA_LITE_MODEL_ID,
+                    messages=[
+                        {"role": "system", "content": "Output only the corrected command. No explanation."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0
+                )
+                corrected = response.choices[0].message.content.strip().strip('"').strip("'")
+                if corrected and len(corrected) > 2:
+                    logger.info(f"Intent interpretation: '{raw_transcription}' → '{corrected}'")
+                    return corrected
+            except Exception as e:
+                logger.error(f"Intent interpretation failed, using raw: {e}")
+            return raw_transcription
 
         async def hybrid_reasoning(user_text, latest_sight, latest_image_b64):
             """Routes task to Nova Lite (simple/launch) or Nova Pro (advanced vision agent)."""
@@ -272,45 +318,98 @@ Output JSON: {{"complexity": "SIMPLE" | "ADVANCED", "reason": "one sentence why"
 CURRENT SCREEN CONTEXT:
 {app_ctx_summary}
 
-CRITICAL RULE — WORK WITH WHAT IS ON SCREEN:
-- The user has asked you to perform a task. Look at the screenshot to understand what is currently visible.
-- If the relevant app or website is ALREADY open, work directly within it. Do NOT open Spotlight, do NOT launch a new browser, do NOT navigate away unless the task explicitly requires it.
-- NEVER use type_text (Spotlight) when the target app/site is already the frontmost window. Instead, click on UI elements, scroll, or use hotkeys to navigate within the existing app.
-- If you need to navigate to a different page within the current browser, use the address bar (Command+L) or click links — do NOT open a new browser window via Spotlight.
+STRATEGIC APPROACH — THINK FIRST, THEN ACT:
+1. On your FIRST step, analyze the screenshot carefully and form a clear PLAN for the task.
+   Include your high-level plan in the "explanation" field (e.g., "Plan: 1) click code editor, 2) select all, 3) type solution, 4) click Submit. Step 1: clicking the code editor area.").
+2. Every subsequent "explanation" must describe WHY this action advances the plan — not just narrate what you're clicking.
+3. If an action doesn't clearly move toward the goal, DO NOT take it.
 
-Resolution: The image you see is the full macOS screen in a normalized 2D coordinate system:
-- X and Y are always in the range [0, 1000], where:
-  - (0, 0) is the top-left corner of the visible screen
-  - (1000, 1000) is the bottom-right corner of the visible screen
-When you output a click at the visual center, use approximately (500, 500).
-The client maps these normalized coordinates directly into the real screen coordinate space.
+CRITICAL RULES:
 
-You MUST be agentic:
-- Do ONE action per step (or "wait" if needed).
-- After an action, you MUST request another screenshot and VERIFY the result before declaring completion.
-- Only set done=true when the screenshot CONFIRMS the task is complete. Do not guess. Always take one more screenshot after an action to verify the result.
+WORK WITH WHAT IS ON SCREEN:
+- If the relevant app/website is ALREADY open, work directly within it.
+- Do NOT open Spotlight, launch a new browser, or navigate away unless the task explicitly requires it.
+- NEVER use type_text (Spotlight) when the target app/site is already the frontmost window.
+- To navigate within the browser, use Command+L for the address bar or click links.
 
-TEXT ENTRY RULES (VERY IMPORTANT):
-- When you need to type into a text field, search bar, or form on screen, use {{"command": "keyboard_type", "text": "..."}}.
-- type_text is ONLY for launching apps via Spotlight. Do NOT use it for anything else.
-- NEVER rely on the clipboard. Do NOT use paste hotkeys such as Command+V / Cmd+V to input text.
-- You may still use other hotkeys for navigation (e.g., Command+L to focus the URL bar, Command+T to open a new tab), but not for pasting content.
+YOU CAN READ THE SCREENSHOT — DON'T CLICK TO READ:
+- You can see and read ALL text visible in the screenshot. You do NOT need to click on elements just to read their content.
+- Do NOT click on tabs, test cases, descriptions, or UI elements just to "view" information that is already visible on screen.
+- If information is visible in the screenshot, use it immediately in your reasoning.
 
-Output ONLY JSON: {{"explanation": "...", "command": "...", "x": number, "y": number, "done": bool}}
+GOAL-FOCUSED EXECUTION:
+- Every action must directly advance toward completing the task.
+- Do NOT explore the UI, click on random elements, or gather information unnecessarily.
+- If you find yourself clicking around without making progress, STOP and reconsider your approach.
+
+FOR CODING / PROBLEM-SOLVING TASKS (e.g., LeetCode, HackerRank, coding challenges):
+a) READ the problem statement directly from the screenshot — it is already visible, no clicking needed.
+b) THINK about the solution and describe it in your "explanation" field.
+c) CLICK on the code editor / text input area to place your cursor there.
+d) Select all existing code (Command+A) and then type your complete solution using keyboard_type.
+e) Do NOT click on test cases, examples, constraints, or description tabs — you can already see everything you need.
+f) After typing the solution, click the Submit or Run button.
+
+COORDINATE SYSTEM:
+Normalized 2D coordinates [0, 1000] x [0, 1000]:
+- (0, 0) = top-left corner of the screen
+- (1000, 1000) = bottom-right corner of the screen
+The client maps these normalized coordinates to actual screen pixels.
+
+AGENTIC BEHAVIOR:
+- Do ONE action per step (or "wait" if the UI is loading).
+- After each action, VERIFY the result in the next screenshot before continuing.
+- Only set done=true when the screenshot CONFIRMS the task is fully complete.
+
+TEXT ENTRY RULES:
+- Use {{"command": "keyboard_type", "text": "..."}} for typing into ANY on-screen field (code editors, search bars, forms, text areas).
+- type_text is ONLY for Spotlight app launching — never for on-screen content.
+- NEVER use paste hotkeys (Command+V / Cmd+V).
+- You may use other hotkeys for navigation (Command+L, Command+T, etc.).
+
+Output ONLY valid JSON: {{"explanation": "strategic reasoning", "command": "...", "x": number, "y": number, "done": bool}}
 
 SUPPORTED COMMANDS:
 - {{"command": "open_url", "url": "https://..."}}
-- {{"command": "click", "x": number (0-1000), "y": number (0-1000)}}
-- {{"command": "type_text", "text": "App Name"}} (ONLY for launching apps via Spotlight)
-- {{"command": "keyboard_type", "text": "string"}} (for typing into on-screen fields)
-- {{"command": "press_hotkey", "keys": ["command", "c"]}}
-- {{"command": "scroll", "amount": number (0-100)}}
+- {{"command": "click", "x": <0-1000>, "y": <0-1000>}}
+- {{"command": "type_text", "text": "App Name"}} (Spotlight ONLY)
+- {{"command": "keyboard_type", "text": "content to type"}} (on-screen typing)
+- {{"command": "press_hotkey", "keys": ["command", "a"]}}
+- {{"command": "scroll", "amount": <positive=down, negative=up>}}
 - {{"command": "wait"}}"""
             conversation_history = [{"role": "system", "content": SENIOR_SYSTEM_PROMPT}]
             last_action = None
+            recent_actions = []   # track last N actions for stuck detection
             
+            def _action_signature(action: dict) -> str:
+                """Compact fingerprint of an action for repetition detection."""
+                cmd = action.get("command", "")
+                if cmd == "click":
+                    return f"click({action.get('x')},{action.get('y')})"
+                elif cmd in ("keyboard_type", "type_text"):
+                    return f"{cmd}({action.get('text', '')[:30]})"
+                elif cmd == "scroll":
+                    return f"scroll({action.get('amount')})"
+                elif cmd == "press_hotkey":
+                    return f"hotkey({action.get('keys')})"
+                elif cmd == "open_url":
+                    return f"url({action.get('url', '')[:40]})"
+                return cmd
+
+            def _detect_cycle(actions: list) -> typing.Optional[int]:
+                """Detect repeating cycles in action history. Returns cycle length or None."""
+                if len(actions) < 4:
+                    return None
+                for cycle_len in range(1, len(actions) // 2 + 1):
+                    if cycle_len > 6:
+                        break
+                    recent = actions[-cycle_len:]
+                    prev = actions[-cycle_len * 2:-cycle_len]
+                    if recent == prev:
+                        return cycle_len
+                return None
+
             try:
-                # Ensure we have at least one screenshot before beginning
                 if not connection_state["latest_screenshot_b64"]:
                     logger.info("Waiting for initial screenshot...")
                     try:
@@ -328,7 +427,42 @@ SUPPORTED COMMANDS:
                     logger.info(f"Agent Step {step+1}/{MAX_AGENT_STEPS} starting...")
                     annotated = annotate_screenshot(current_screenshot, last_action)
                     
-                    user_text_msg = f"Task: {user_text}" if step == 0 else "Continue task."
+                    if step == 0:
+                        user_text_msg = (
+                            f"Task: {user_text}\n"
+                            "Analyze the screenshot carefully. In your explanation, describe your HIGH-LEVEL PLAN "
+                            "for completing this task (numbered steps), then take the FIRST action that begins executing that plan.\n"
+                            "Remember: you can READ all text visible in the screenshot — do NOT click on things just to read them."
+                        )
+                    else:
+                        user_text_msg = (
+                            f"Task (reminder): {user_text}\n"
+                            "Here is the current screenshot after your last action. "
+                            "Evaluate whether your last action succeeded, then take the next step toward the goal."
+                        )
+                    
+                    # Stuck detection: check for identical repeats or cyclic patterns
+                    cycle_len = _detect_cycle(recent_actions)
+                    if cycle_len is not None:
+                        cycle_actions = recent_actions[-cycle_len:]
+                        logger.warning(f"CYCLE DETECTED (length {cycle_len}): {cycle_actions}")
+                        user_text_msg += (
+                            f"\n\nCRITICAL WARNING: You are stuck in a repeating loop of {cycle_len} actions: "
+                            f"{cycle_actions}. These actions are NOT making progress toward the goal.\n"
+                            "You MUST completely change your approach. Ask yourself:\n"
+                            "- What is the ACTUAL GOAL? (e.g., write code, not explore the UI)\n"
+                            "- Am I clicking on things I should be READING from the screenshot instead?\n"
+                            "- Should I be TYPING something instead of clicking?\n"
+                            "- Do I need to scroll, use a hotkey, or interact with a completely different part of the screen?\n"
+                            "Take a fundamentally different action NOW."
+                        )
+                    elif len(recent_actions) >= 2 and len(set(recent_actions[-2:])) == 1:
+                        logger.warning(f"STUCK DETECTED: repeated '{recent_actions[-1]}' twice.")
+                        user_text_msg += (
+                            f"\n\nWARNING: You repeated the same action ({recent_actions[-1]}) twice. "
+                            "It is not working. Try a completely different approach."
+                        )
+
                     user_content = [
                         {"type": "text", "text": user_text_msg},
                         {
@@ -340,6 +474,14 @@ SUPPORTED COMMANDS:
                     ]
                     conversation_history.append({"role": "user", "content": user_content})
                     
+                    # Trim conversation to keep context focused and avoid overwhelming the model.
+                    # Keep: system prompt + first exchange (plan) + last 3 exchanges (6 messages).
+                    if len(conversation_history) > 9:
+                        conversation_history = (
+                            conversation_history[:3]
+                            + conversation_history[-6:]
+                        )
+
                     response = nova_pro_client.chat.completions.create(
                         model=NOVA_PRO_MODEL_ID,
                         messages=conversation_history,
@@ -357,16 +499,15 @@ SUPPORTED COMMANDS:
                     logger.info(f"Agent parsed data: {data}")
                     cmd = data.get("command")
                     performed_action = False
-                    # Only forward actual tool commands to the client.
                     if cmd in {"open_url", "click", "type_text", "keyboard_type", "press_hotkey", "scroll", "wait"}:
                         last_action = data
+                        recent_actions.append(_action_signature(data))
                         logger.info(f"Sending command to client: {cmd}")
                         await websocket.send_text(json.dumps(data))
                         await asyncio.sleep(ACTION_SETTLE_TIME)
                         performed_action = True
                         
                     # Guardrail: never allow "done" on the same step we performed an action.
-                    # We always require at least one follow-up screenshot to verify completion.
                     if data.get("done") and performed_action:
                         logger.info("Agent requested done immediately after action; forcing verification step.")
                         data["done"] = False
@@ -375,6 +516,25 @@ SUPPORTED COMMANDS:
                         logger.info("Agent signaled completion (done=True).")
                         break
                     
+                    # Hard bail if stuck even after the cycle warning was injected
+                    if len(recent_actions) >= 6:
+                        cycle_len_check = _detect_cycle(recent_actions)
+                        if cycle_len_check is not None:
+                            # Check if the cycle has repeated 3+ times
+                            total_cycle_actions = cycle_len_check * 3
+                            if len(recent_actions) >= total_cycle_actions:
+                                tail = recent_actions[-total_cycle_actions:]
+                                chunks = [
+                                    tuple(tail[i * cycle_len_check:(i + 1) * cycle_len_check])
+                                    for i in range(3)
+                                ]
+                                if len(set(chunks)) == 1:
+                                    logger.error(
+                                        f"Agent hopelessly stuck in cycle of length {cycle_len_check}: "
+                                        f"{list(chunks[0])}, aborting loop."
+                                    )
+                                    break
+
                     connection_state["screenshot_event"].clear()
                     await websocket.send_text(json.dumps({"command": "capture_screen"}))
                     await asyncio.wait_for(connection_state["screenshot_event"].wait(), timeout=SCREENSHOT_TIMEOUT)
@@ -387,7 +547,7 @@ SUPPORTED COMMANDS:
             if not full_text: return
             
             connection_state["command_triggered"] = True
-            logger.info(f"Processing (One-Shot): {full_text}")
+            logger.info(f"Raw transcription: {full_text}")
             
             # Cancel any pending debounce
             if connection_state["debounce_task"]: connection_state["debounce_task"].cancel()
@@ -398,7 +558,9 @@ SUPPORTED COMMANDS:
                 logger.warning(f"Failed to send activity start: {e}")
 
             try:
-                action = await hybrid_reasoning(full_text, connection_state["latest_sight"], connection_state["latest_screenshot_b64"])
+                interpreted_text = await interpret_intent(full_text)
+                logger.info(f"Processing (interpreted): {interpreted_text}")
+                action = await hybrid_reasoning(interpreted_text, connection_state["latest_sight"], connection_state["latest_screenshot_b64"])
                 if action: await websocket.send_text(json.dumps(action))
                 
                 # Wait for agent loop if it was started
@@ -419,56 +581,79 @@ SUPPORTED COMMANDS:
             await asyncio.sleep(1.5)
             await process_complete_transcription()
 
-        # Initialize Deepgram
-        deepgram = AsyncDeepgramClient(api_key=DEEPGRAM_API_KEY)
-        
-        async with deepgram.listen.v1.connect(
-            model="nova-2-general", 
-            language="en-US", 
-            encoding="linear16", 
-            channels="1", 
-            sample_rate="16000"
-        ) as dg_socket:
-            
-            async def on_message(result: typing.Any):
-                if result.type == "Results":
-                    # If we already triggered a command, ignore further audio chunks
-                    if connection_state["command_triggered"]: return
+        # Build ElevenLabs WebSocket URL with query params
+        el_params = (
+            f"?model_id=scribe_v2_realtime"
+            f"&language_code=en"
+            f"&audio_format=pcm_16000"
+            f"&commit_strategy=vad"
+            f"&vad_silence_threshold_secs=1.2"
+        )
+        el_url = ELEVENLABS_STT_WS_URL + el_params
+        el_headers = {"xi-api-key": ELEVENLABS_API_KEY}
 
-                    # Only buffer 'is_final' transcripts to prevent duplicate partial merges
-                    if result.is_final and result.channel.alternatives[0].transcript:
-                        sentence = result.channel.alternatives[0].transcript
-                        if sentence.strip():
-                            connection_state["transcription_buffer"].append(sentence)
-                            logger.info(f"Buffered (is_final): {sentence}")
-                            
-                            # If Deepgram thinks the speech is truly finished, process immediately
-                            if result.speech_final:
-                                if connection_state["debounce_task"]: connection_state["debounce_task"].cancel()
-                                await process_complete_transcription()
-                                return
+        async with ws_client.connect(el_url, additional_headers=el_headers) as el_ws:
+            logger.info("Connected to ElevenLabs Scribe v2 Realtime STT")
 
-                            # Reset debounce timer for cases where speech_final isn't triggered yet
-                            if connection_state["debounce_task"]: connection_state["debounce_task"].cancel()
-                            connection_state["debounce_task"] = asyncio.create_task(debounce_and_process())
+            async def listen_elevenlabs():
+                """Receive transcription events from ElevenLabs."""
+                try:
+                    async for msg in el_ws:
+                        if connection_state["command_triggered"]:
+                            continue
+                        try:
+                            data = json.loads(msg)
+                            msg_type = data.get("message_type", "")
 
-            dg_socket.on(EventType.MESSAGE, on_message)
-            listening_task = asyncio.create_task(dg_socket.start_listening())
+                            if msg_type == "session_started":
+                                logger.info(f"ElevenLabs session started: {data.get('session_id')}")
+
+                            elif msg_type == "partial_transcript":
+                                text = data.get("text", "").strip()
+                                if text:
+                                    logger.info(f"Partial: {text}")
+
+                            elif msg_type in ("committed_transcript", "committed_transcript_with_timestamps"):
+                                text = data.get("text", "").strip()
+                                if text:
+                                    logger.info(f"Committed transcript: {text}")
+                                    connection_state["transcription_buffer"].append(text)
+
+                                    if connection_state["debounce_task"]:
+                                        connection_state["debounce_task"].cancel()
+                                    await process_complete_transcription()
+
+                            elif msg_type in ("error", "auth_error", "quota_exceeded",
+                                              "rate_limited", "transcriber_error"):
+                                logger.error(f"ElevenLabs STT error: {data}")
+
+                        except json.JSONDecodeError:
+                            logger.warning(f"Non-JSON from ElevenLabs: {msg[:100]}")
+                except Exception as e:
+                    logger.error(f"ElevenLabs listener error: {e}")
+
+            el_listen_task = asyncio.create_task(listen_elevenlabs())
 
             try:
                 while True:
-                    # We no longer break on command_triggered here.
-                    # This loop must stay alive to receive 'screen_captured' events
-                    # while the one-shot agent task is running.
-                    # It will exit naturally when websocket.close() is called or the client disconnects.
-                        
                     try:
                         message = await websocket.receive()
                     except RuntimeError:
-                        # Session closed by one-shot handler or client
                         break
                     if message.get("bytes"):
-                        await dg_socket.send_media(message.get("bytes"))
+                        if not connection_state["command_triggered"]:
+                            pcm_bytes = message["bytes"]
+                            audio_b64 = base64.b64encode(pcm_bytes).decode("utf-8")
+                            chunk_msg = json.dumps({
+                                "message_type": "input_audio_chunk",
+                                "audio_base_64": audio_b64,
+                                "commit": False,
+                                "sample_rate": 16000
+                            })
+                            try:
+                                await el_ws.send(chunk_msg)
+                            except Exception as e:
+                                logger.error(f"Failed to send audio to ElevenLabs: {e}")
                     elif message.get("text"):
                         data = json.loads(message["text"])
                         if data.get("event") == "screen_captured":
@@ -478,8 +663,7 @@ SUPPORTED COMMANDS:
             except WebSocketDisconnect:
                 logger.info("Client disconnected")
             finally:
-                listening_task.cancel()
-                await dg_socket.send_finalize()
+                el_listen_task.cancel()
     except Exception as e: 
         logger.error(f"WebSocket error: {e}")
         import traceback
