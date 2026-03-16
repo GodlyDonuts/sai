@@ -13,8 +13,15 @@ import mss
 import mss.tools
 import pyautogui
 from dotenv import load_dotenv
+import subprocess
+from PIL import Image
+import io
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
+
+# Global variables to store the exact dimensions of the last capture
+latest_screenshot_width = 2560
+latest_screenshot_height = 1600
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -134,21 +141,52 @@ class WakeWordDetector:
 # ==============================================================================
 
 def capture_screen_sync() -> dict:
-    """Captures the primary screen using mss, compresses to PNG, and returns base64 and dimensions."""
-    with mss.mss() as sct:
-        monitor = sct.monitors[1]  # Primary monitor
-        sct_img = sct.grab(monitor)
-        # Compress to PNG
-        png_bytes = mss.tools.to_png(sct_img.rgb, sct_img.size)
+    """Captures screen natively, then resizes to logical display size for 1:1 brain mapping."""
+    file_path = "/tmp/sai_capture.png"
+    
+    try:
+        # 1. Native macOS capture (e.g., 2880x1800 on Retina)
+        subprocess.run(["screencapture", "-x", "-C", file_path], check=True)
+        
+        # 2. Get logical size (e.g., 1440x900)
+        logical_w, logical_h = pyautogui.size()
+        
+        with Image.open(file_path) as img:
+            # 3. Downsample to logical size for 1:1 mapping
+            # This makes the "Vision" identical to the "Execution" space.
+            resized_img = img.resize((logical_w, logical_h), Image.Resampling.LANCZOS)
+            
+            buf = io.BytesIO()
+            resized_img.convert("RGB").save(buf, format="JPEG", quality=85)
+            b64_img = base64.b64encode(buf.getvalue()).decode('utf-8')
+            
+        logging.info(f"CAPTURED: Physical={img.size}, Resized to Logical={logical_w}x{logical_h}")
         return {
-            "image_base64": base64.b64encode(png_bytes).decode('utf-8'),
-            "width": sct_img.size.width,
-            "height": sct_img.size.height
+            "image_base64": b64_img,
+            "width": logical_w,
+            "height": logical_h
         }
+    except Exception as e:
+        logging.error(f"Native capture failed: {e}")
+        return {"error": str(e)}
 
 def perform_click_sync(x: int, y: int):
-    """Performs a physical mouse click at the specified coordinates."""
-    pyautogui.click(x, y)
+    """Click with 1:1 mapping (Resized capture ensures brain coords == logical coords)."""
+    try:
+        # No scaling needed! Resize to logical resolution on capture
+        # ensures brain's (x, y) is already in PyAutoGUI's space.
+        logging.warning(f"COORD 1:1 DEBUG: Brain=({x}, {y}), Clicking={x}, {y}")
+        
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        
+    except Exception as e:
+        logging.error(f"Perform click failed: {e}")
+
+def perform_scroll_sync(amount: int):
+    """Scrolls the screen. Positive amount = up, negative = down."""
+    # Note: macOS scrolling can be sensitive.
+    pyautogui.scroll(amount)
 
 def perform_type_sync(text: str):
     """Presses Cmd+Space to open Spotlight, clears it, types, and launches."""
@@ -185,6 +223,10 @@ def perform_keyboard_type_sync(text: str):
             pyautogui.press("enter")
             time.sleep(0.1)
 
+def perform_hotkey_sync(keys: list):
+    """Presses a combination of keys together (e.g., ['command', 'n'])."""
+    pyautogui.hotkey(*keys)
+
 def perform_open_url_sync(url: str):
     """Opens a URL directly in the default browser."""
     # Ensure URL looks valid enough
@@ -194,42 +236,23 @@ def perform_open_url_sync(url: str):
     logging.info(f"Navigating to: {url}")
     subprocess.run(["open", url])
 
-async def receive_audio_from_websocket(websocket, output_stream):
+async def receive_audio_from_websocket(websocket):
     """
-    Listens for binary audio data from the WebSocket and writes it to the PyAudio output stream.
-    Also handles text (JSON) commands for OS control.
+    Listens for text (JSON) commands from the server for OS control.
+    Silent operation: no binary audio playback.
     """
-    downstream_audio_queue = asyncio.Queue()
-    
     try:
-        logging.info("Started audio reception worker.")
+        logging.info("Started server command listener.")
         loop = asyncio.get_running_loop()
         
-        async def audio_player():
-            while True:
-                chunk = await downstream_audio_queue.get()
-                if chunk is None:
-                    break # exit signal
-                await loop.run_in_executor(
-                    None, 
-                    functools.partial(output_stream.write, chunk, exception_on_underflow=False)
-                )
-                
-        player_task = asyncio.create_task(audio_player())
-        
         async for message in websocket:
-            if isinstance(message, bytes):
-                # Route binary PCM data to the queue so we do not block the websocket receiving thread!
-                # logging.debug(f"Received {len(message)} bytes of audio")
-                await downstream_audio_queue.put(message)
-            else:
+            if not isinstance(message, bytes):
                 try:
                     data = json.loads(message)
                     logging.info(f"SERVER COMMAND RECEIVED: {json.dumps(data, indent=2)}")
                     
                     command = data.get("command")
                     if command == "capture_screen":
-                        # Execute screen capture in a background thread to prevent blocking
                         capture_data = await loop.run_in_executor(None, capture_screen_sync)
                         response = {
                             "event": "screen_captured",
@@ -241,61 +264,47 @@ async def receive_audio_from_websocket(websocket, output_stream):
                         logging.info(f"Sent screen capture ({capture_data['width']}x{capture_data['height']}).")
                         
                     elif command == "click":
-                        x = data.get("x")
-                        y = data.get("y")
+                        x, y = data.get("x"), data.get("y")
                         if x is not None and y is not None:
                             await loop.run_in_executor(None, perform_click_sync, int(x), int(y))
-                            logging.info(f"Performed click at ({x}, {y})")
                         else:
-                            logging.warning(f"Click command missing x or y coordinates: {data}")
+                            logging.warning(f"Click command missing x or y: {data}")
                             
                     elif command == "type_text":
                         text = data.get("text", "")
                         await loop.run_in_executor(None, perform_type_sync, text)
-                        logging.info(f"Typed text via Spotlight: {text}")
 
                     elif command == "open_url":
                         url = data.get("url", "")
                         await loop.run_in_executor(None, perform_open_url_sync, url)
-                        logging.info(f"Opened URL directly: {url}")
 
                     elif command == "keyboard_type":
                         text = data.get("text", "")
                         await loop.run_in_executor(None, perform_keyboard_type_sync, text)
-                        logging.info(f"Typed text into focused field: {text}")
+
+                    elif command == "press_hotkey":
+                        keys = data.get("keys", [])
+                        if keys:
+                            await loop.run_in_executor(None, perform_hotkey_sync, keys)
+
+                    elif command == "scroll":
+                        amount = data.get("amount", -10)
+                        await loop.run_in_executor(None, perform_scroll_sync, int(amount))
 
                 except json.JSONDecodeError:
-                    logging.warning(f"Received unknown message type: {message}")
+                    logging.warning(f"Received unknown message: {message}")
     except websockets.ConnectionClosed:
-        logging.warning("Output: WebSocket connection closed.")
+        logging.warning("WebSocket connection closed.")
     except Exception as e:
-        logging.error(f"Error receiving audio: {e}")
-    finally:
-        await downstream_audio_queue.put(None)
-        if 'player_task' in locals():
-            await player_task
+        logging.error(f"Error in command listener: {e}")
 
 async def stream_audio_to_websocket(detector: WakeWordDetector):
-    """
-    Connects to the server, sends a handshake, and manages concurrent audio 
-    streaming (mic to cloud) and playback (cloud to local speakers).
-    """
     uri = "ws://localhost:8080/ws/agent"
     detector.audio_queue = asyncio.Queue()
     detector.is_streaming = True
     
-    # Initialize PyAudio for output (Playback)
-    pa_output = pyaudio.PyAudio()
-    output_stream = pa_output.open(
-        rate=16000,
-        channels=1,
-        format=pyaudio.paInt16,
-        output=True,
-        frames_per_buffer=1024 # Small buffer for low latency
-    )
-
     async def _send_audio(ws):
-        logging.info("Handshake sent. Now streaming upstream audio...")
+        logging.info("Streaming upstream audio...")
         while detector.is_streaming:
             try:
                 # Wait for audio data from the detector loop
@@ -307,33 +316,22 @@ async def stream_audio_to_websocket(detector: WakeWordDetector):
                 break
 
     try:
-        logging.info(f"Connecting to WebSocket at {uri}...")
+        logging.info(f"Connecting to {uri}...")
         async with websockets.connect(uri) as websocket:
             # Step 1: Handshake
-            handshake = {
-                "event": "wake_word_detected",
-                "timestamp": time.time()
-            }
-            await websocket.send(json.dumps(handshake))
+            await websocket.send(json.dumps({"event": "wake_word_detected", "timestamp": time.time()}))
             
             # Step 2: Run upstream and downstream concurrently
             await asyncio.gather(
                 _send_audio(websocket),
-                receive_audio_from_websocket(websocket, output_stream)
+                receive_audio_from_websocket(websocket)
             )
-                    
     except Exception as e:
         logging.error(f"WebSocket session error: {e}")
     finally:
-        logging.info("Cleaning up WebSocket and playback resources...")
+        logging.info("Cleaning up session resources...")
         detector.is_streaming = False
         detector.audio_queue = None
-        
-        # Cleanup Playback
-        if output_stream:
-            output_stream.stop_stream()
-            output_stream.close()
-        pa_output.terminate()
 
 def on_wake_word(detector: WakeWordDetector):
     """Callback triggered when the wake word is detected."""

@@ -5,11 +5,11 @@ Sai is a voice-native OS co-pilot for macOS. It uses a **Hybrid Brain** architec
 
 | Layer | Technology | Role |
 |---|---|---|
-| **Senses** | Gemini 2.5 Flash Native Audio (Google WebSocket) | Voice input, audio playback, real-time transcription |
-| **Routing Brain** | Nvidia Nemotron 3 Super 120B (OpenRouter, free) | Classifies command as SIMPLE or ADVANCED |
-| **Simple Brain** | Nvidia Nemotron 3 Super 120B (OpenRouter, free) | Extracts single tool call for app launches |
-| **Senior Brain** | Gemini 3 Flash Preview (OpenRouter) | Multi-step vision reasoning for complex tasks |
-| **Client Executor** | Python + PyAutoGUI + mss | Executes physical Mac actions |
+| **Senses** | Deepgram Nova-2 | Real-time audio transcription (upstream only) |
+| **Routing Brain** | Amazon Nova 2 Lite (AWS Bedrock) | Classifies command as SIMPLE or ADVANCED |
+| **Simple Brain** | Amazon Nova 2 Lite (AWS Bedrock) | Extracts single tool call for app launches |
+| **Senior Brain** | Amazon Nova 2 Pro (AWS Bedrock) | Multi-step vision reasoning for complex tasks |
+| **Client Executor** | Python + PyAutoGUI + mss | Executes physical Mac actions (Silent) |
 
 ---
 
@@ -19,17 +19,17 @@ The full end-to-end pipeline is **working**. Wake word is detected, audio stream
 
 ### Architecture Flow
 1. **User says "Hey Sai..."** → `wake_word.py` detects wake word via Picovoice Porcupine
-2. **Screenshot auto-captured** → Sent to server and forwarded to Gemini for visual context
-3. **Audio streams** → `wake_word.py` → FastAPI WebSocket → Gemini Live API
-4. **Gemini transcribes** → Fragments are **buffered** with a 1.5s debounce before processing
-5. **Router classifies** → SIMPLE (Nemotron) or ADVANCED (multi-step agent loop)
+2. **Screenshot auto-captured** → Sent to server for visual context
+3. **Audio streams** → `wake_word.py` → FastAPI WebSocket → Deepgram Live API
+4. **Deepgram transcribes** → Sentences are processed immediately with a 1.5s debounce
+5. **Router classifies** → SIMPLE (Nova Lite) or ADVANCED (multi-step agent loop)
 6. **SIMPLE path** → Single tool command extracted and sent to client immediately
 7. **ADVANCED path** → Multi-step agent loop (up to 10 steps):
-   - Screenshot is annotated with red coordinate grid (every 200px)
-   - Gemini 3 Flash reasons about the screenshot and outputs a command
+   - Screenshot is sent to Nova Pro
+   - Nova Pro reasons about the screenshot and outputs a command
    - Command is executed on Mac, then a **fresh screenshot** is captured
    - Loop continues until the model reports `"done": true`
-8. **Gemini speaks** → Audio streamed back to client for playback
+8. **Silent Operation** → No audio is streamed back; the agent operates silently.
 
 ---
 
@@ -38,10 +38,11 @@ The full end-to-end pipeline is **working**. Wake word is detected, audio stream
 | Setting | Value |
 |---|---|
 | Wake Word Model | Picovoice Porcupine (`HeySai_mac.ppn`) |
-| Gemini Audio Model | `models/gemini-2.5-flash-native-audio-preview-12-2025` |
-| Routing / Simple Brain | `nvidia/nemotron-3-super-120b-a12b:free` |
-| Senior Brain (Vision) | `google/gemini-3-flash-preview` |
+| Senses (Transcription) | Deepgram Nova-2 |
+| Routing / Simple Brain | Amazon Nova 2 Lite (AWS Bedrock) |
+| Senior Brain (Vision) | Amazon Nova 2 Pro (AWS Bedrock) |
 | Client OS Control | `pyautogui` + `mss` (screenshot) + `pbcopy` (clipboard paste) |
+| Audio Output | Disabled (Silent Mode) |
 
 ---
 

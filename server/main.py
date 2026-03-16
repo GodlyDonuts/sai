@@ -7,9 +7,14 @@ import io
 import collections
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from datetime import datetime
-import websockets
+import boto3
+from deepgram import (
+    DeepgramClient,
+    DeepgramClientOptions,
+    LiveTranscriptionEvents,
+    LiveOptions,
+)
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
 from PIL import Image, ImageDraw, ImageFont
 
 # Load environment variables from .env file
@@ -19,51 +24,71 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sai-server")
 
-app = FastAPI(title="Sai OS Agent Cloud Backend")
+app = FastAPI(title="Sai OS Agent Cloud Backend (Nova + Deepgram)")
 
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-GEMINI_WS_URL = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={GEMINI_API_KEY}"
-
-# cerebras_client = AsyncOpenAI(
-#     api_key=CEREBRAS_API_KEY,
-#     base_url="https://api.cerebras.ai/v1"
-# )
-
-openrouter_client = AsyncOpenAI(
-    api_key=OPENROUTER_API_KEY,
-    base_url="https://api.cerebras.ai/v1" if not OPENROUTER_API_KEY else "https://openrouter.ai/api/v1"
+# Bedrock setup for Amazon Nova
+session = boto3.Session(
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    region_name=os.getenv("AWS_REGION", "us-east-1")
 )
+bedrock_runtime = session.client(service_name='bedrock-runtime')
+
+NOVA_LITE_MODEL_ID = "amazon.nova-lite-v1:0"
+NOVA_PRO_MODEL_ID = "amazon.nova-pro-v1:0"
 
 MAX_AGENT_STEPS = 10
 ACTION_SETTLE_TIME = 2.0  # seconds to wait after an action for the UI to update
 SCREENSHOT_TIMEOUT = 5.0  # seconds to wait for a screenshot from client
 
-def annotate_screenshot(image_b64: str) -> str:
-    """Draw coordinate axis labels on the screenshot edges so the vision model can estimate click positions."""
+def annotate_screenshot(image_b64: str, last_action: dict = None) -> str:
+    """Draw minimal edge-only ruler ticks and optional last action marker on the screenshot.
+    
+    No full-screen grid lines — only small tick marks along the top and left edges
+    every 200px so the LLM can use them as spatial references without cluttering the UI.
+    """
     try:
         img_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         draw = ImageDraw.Draw(img)
         w, h = img.size
         
-        # Use a small default font
+        # Try to load a font, otherwise use default
         try:
-            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 14)
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 13)
         except:
             font = ImageFont.load_default()
         
-        # Draw X-axis labels along the top edge
-        for x in range(0, w, 200):
-            draw.text((x + 2, 2), str(x), fill="red", font=font)
-            draw.line([(x, 0), (x, 15)], fill="red", width=1)
+        TICK_LEN = 12       # length of ruler tick marks in pixels
+        LABEL_PAD = 2       # padding between tick and label text
+        STEP = 200          # ruler interval in pixels
+        TICK_COLOR = (255, 60, 60)  # red ticks
+        LABEL_COLOR = (255, 255, 255)  # white labels for readability
         
-        # Draw Y-axis labels along the left edge
-        for y in range(0, h, 200):
-            draw.text((2, y + 2), str(y), fill="red", font=font)
-            draw.line([(0, y), (15, y)], fill="red", width=1)
+        # --- Top edge ruler (X-axis) ---
+        for x in range(0, w, STEP):
+            if x == 0:
+                continue  # skip origin to avoid overlap
+            draw.line([(x, 0), (x, TICK_LEN)], fill=TICK_COLOR, width=2)
+            draw.text((x + LABEL_PAD, LABEL_PAD), str(x), fill=LABEL_COLOR, font=font)
+        
+        # --- Left edge ruler (Y-axis) ---
+        for y in range(0, h, STEP):
+            if y == 0:
+                continue
+            draw.line([(0, y), (TICK_LEN, y)], fill=TICK_COLOR, width=2)
+            draw.text((LABEL_PAD, y + LABEL_PAD), str(y), fill=LABEL_COLOR, font=font)
+        
+        # --- Last-click crosshair (debug feedback) ---
+        if last_action and last_action.get("command") == "click":
+            lx, ly = int(last_action.get("x", 0)), int(last_action.get("y", 0))
+            r = 20
+            draw.ellipse([lx-r, ly-r, lx+r, ly+r], outline="lime", width=3)
+            draw.line([lx-r*2, ly, lx+r*2, ly], fill="lime", width=2)
+            draw.line([lx, ly-r*2, lx, ly+r*2], fill="lime", width=2)
+            draw.text((lx + r + 5, ly - 10), f"CLICKED ({lx},{ly})", fill="lime", font=font)
         
         # Encode back to base64 PNG
         buf = io.BytesIO()
@@ -82,490 +107,135 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("New client connection established")
     
-    # Shared state between upstream and downstream
-    # Event to coordinate screenshot arrivals between upstream and the agent loop
-    screenshot_event = asyncio.Event()
-    
     connection_state = {
-        "last_call_id": None,
-        "recent_model_replies": collections.deque(maxlen=3),
         "latest_sight": "No visual context yet.",
         "latest_screenshot_b64": None,
         "transcription_buffer": [],
         "debounce_task": None,
-        "agent_running": False  # Prevents concurrent agent loops
+        "active_agent_task": None,
+        "screenshot_event": asyncio.Event()
     }
     
-    if not GEMINI_API_KEY:
-        logger.error("GEMINI_API_KEY not found in environment")
-        await websocket.close(code=1011) # Internal Error
+    if not DEEPGRAM_API_KEY:
+        logger.error("DEEPGRAM_API_KEY not found in environment")
+        await websocket.close(code=1011)
         return
 
     try:
         # Initial Handshake with local client
-        # Expecting: {"event": "wake_word_detected", "timestamp": <time>}
         initial_data = await websocket.receive_text()
-        try:
-            event_payload = json.loads(initial_data)
-            if event_payload.get("event") == "wake_word_detected":
-                timestamp = event_payload.get("timestamp")
-                logger.info(f"Handshake successful: Wake word detected at {timestamp}")
-                
-                # Acknowledge handshake
-                await websocket.send_json({"status": "handshake_complete"})
-                
-                # AUTO-TRIGGER SCREENSHOT: Ensure we have "Fresh Eyes" for the upcoming command
-                logger.info("Auto-triggering initial screenshot for visual context.")
-                await websocket.send_text(json.dumps({"command": "capture_screen"}))
-            else:
-                logger.warning(f"Unexpected initial event: {event_payload}")
-                await websocket.close(code=1003) # Unsupported Data
-                return
-        except json.JSONDecodeError:
-            logger.error("Malformed JSON during handshake")
+        event_payload = json.loads(initial_data)
+        if event_payload.get("event") == "wake_word_detected":
+            logger.info("Handshake successful")
+            await websocket.send_json({"status": "handshake_complete"})
+            # Trigger initial screenshot
+            await websocket.send_text(json.dumps({"command": "capture_screen"}))
+        else:
             await websocket.close(code=1003)
             return
 
-        # Connect to Google Gemini API
-        async with websockets.connect(GEMINI_WS_URL) as google_ws:
-            logger.info("Connected to Gemini API WebSocket")
+        # Define reasoning inside so it has access to websocket and state
+        async def hybrid_reasoning(user_text, latest_sight, latest_image_b64):
+            """Routes task to Nova Lite (simple/routing) or Nova Pro (advanced + vision)."""
+            routing_prompt = f"""You are the Task Router for Sai. Determine complexity: SIMPLE or ADVANCED.\nUser said: "{user_text}"\nOutput JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
+            try:
+                body = json.dumps({
+                    "system": [{"text": "Output JSON only."}],
+                    "messages": [{"role": "user", "content": [{"text": routing_prompt}]}],
+                    "inferenceConfig": {"max_tokens": 64, "temperature": 0}
+                })
+                response = bedrock_runtime.invoke_model(modelId=NOVA_LITE_MODEL_ID, body=body)
+                routing_data = json.loads(json.loads(response.get('body').read())['output']['message']['content'][0]['text'])
+                complexity = routing_data.get("complexity", "SIMPLE").upper()
+            except: complexity = "SIMPLE"
 
-            # Send Setup Message (BidiGenerateContentSetup format)
-            # Reference: https://ai.google.dev/api/live#BidiGenerateContentSetup
-            # - "setup" is the raw WebSocket wrapper key
-            # - responseModalities/speechConfig go INSIDE generationConfig
-            # - inputAudioTranscription/outputAudioTranscription go at setup ROOT
-            setup_msg = {
-                "setup": {
-                    "model": "models/gemini-2.5-flash-native-audio-preview-12-2025",
-                    "generationConfig": {
-                        "responseModalities": ["AUDIO"],
-                        "speechConfig": {
-                            "voiceConfig": {
-                                "prebuiltVoiceConfig": {
-                                    "voiceName": "Aoede"
-                                }
-                            }
-                        }
-                    },
-                    "systemInstruction": {
-                        "parts": [{
-                            "text": "You are the Voice and Sensory Interface for Sai. Your ONLY job is to transcribe audio from the user and speak short, confirming messages. \n\nRULES:\n- Do NOT provide advice. \n- Do NOT list plans.\n- If the user asks for something, JUST say 'Got it' or 'On it' or 'Launching Safari'. \n- Do NOT try to use tools yourself. The server handles logic via transcription."
-                        }]
-                    },
-                    "inputAudioTranscription": {},
-                    "outputAudioTranscription": {}
-                }
-            }
-            
-            await google_ws.send(json.dumps(setup_msg))
-            logger.info("Setup message sent to Gemini")
-
-            async def upstream():
-                """Client -> Google"""
+            if complexity == "SIMPLE":
                 try:
-                    while True:
-                        message = await websocket.receive()
-                        if message.get("type") == "websocket.disconnect":
-                            raise WebSocketDisconnect(message.get("code", 1000))
-                            
-                        if message.get("bytes"):
-                            # Audio bytes
-                            audio_chunk = message.get("bytes")
-                            # logger.debug(f"Upstream: Sending {len(audio_chunk)} bytes to Google")
-                            payload = {
-                                "realtimeInput": {
-                                    "audio": {
-                                        "data": base64.b64encode(audio_chunk).decode("utf-8"),
-                                        "mimeType": "audio/pcm;rate=16000"
-                                    }
-                                }
-                            }
-                            await google_ws.send(json.dumps(payload))
-                        elif message.get("text"):
-                            # Text JSON from client (e.g. screen capture response)
-                            try:
-                                data = json.loads(message["text"])
-                                if data.get("event") == "screen_captured":
-                                    image_b64 = data.get("image_base64")
-                                    # Store locally for Senior Brain
-                                    connection_state["latest_screenshot_b64"] = image_b64
-                                    # Signal any waiting agent loop that a new screenshot is ready
-                                    screenshot_event.set()
-                                    
-                                    width = data.get("width", 1920)
-                                    height = data.get("height", 1080)
-                                    logger.info(f"Received screen capture from client ({width}x{height}). Stored and forwarding to Gemini.")
-                                    # Forward as user turn with an image part
-                                    # This avoids "Invalid Argument" for tool IDs and allows Gemini to "see"
-                                    client_content_payload = {
-                                        "clientContent": {
-                                            "turns": [{
-                                                "role": "user",
-                                                "parts": [
-                                                    {
-                                                        "text": "Here is the screenshot of my screen."
-                                                    },
-                                                    {
-                                                        "inlineData": {
-                                                            "mimeType": "image/jpeg",
-                                                            "data": image_b64
-                                                        }
-                                                    }
-                                                ]
-                                            }],
-                                            "turnComplete": True
-                                        }
-                                    }
-                                    await google_ws.send(json.dumps(client_content_payload))
-                            except json.JSONDecodeError:
-                                logger.error("Received malformed JSON text from client.")
+                    body = json.dumps({
+                        "system": [{"text": "Convert to tool JSON. e.g. 'Open Safari' -> {\"command\": \"type_text\", \"text\": \"Safari\"}"}],
+                        "messages": [{"role": "user", "content": [{"text": user_text}]}],
+                        "inferenceConfig": {"max_tokens": 128, "temperature": 0}
+                    })
+                    resp = bedrock_runtime.invoke_model(modelId=NOVA_LITE_MODEL_ID, body=body)
+                    return json.loads(json.loads(resp.get('body').read())['output']['message']['content'][0]['text'])
+                except: return None
+            else:
+                if connection_state["active_agent_task"] and not connection_state["active_agent_task"].done():
+                    connection_state["active_agent_task"].cancel()
+                connection_state["active_agent_task"] = asyncio.create_task(run_agent_loop(user_text))
+                return None
 
-                except websockets.exceptions.ConnectionClosed as e:
-                    logger.info(f"Gemini disconnected (upstream) code={e.code} reason='{e.reason}'")
-                except WebSocketDisconnect:
-                    logger.info("Client disconnected (upstream)")
-                except Exception as e:
-                    logger.error(f"Error in upstream: {e}")
-                finally:
-                    # If upstream exits, ensure downstream also exits
-                    if not websocket.client_state.name == "DISCONNECTED":
-                        try:
-                            await websocket.close()
-                        except RuntimeError:
-                            pass
-
-            async def hybrid_reasoning(user_text, latest_sight, latest_image_b64):
-                """Routes task to Llama (simple) or Gemini 3 (advanced + vision)."""
-                # STEP 1: Routing Decision (Llama 3.3-70b)
-                # Heuristic: If it looks like a URL or complex intent, ADVANCED.
-                url_keywords = [".com", ".org", ".net", ".io", "http", "www", "search", "navigate", "go to", "find"]
-                if any(k in user_text.lower() for k in url_keywords):
-                    complexity = "ADVANCED"
-                else:
-                    routing_prompt = f"""You are the Task Router for Sai.
-Analyze the user command. Determine if it can be handled by a simple app launch or if it needs the Senior Brain (Vision/Browsing/Complex Apps).
-
-SIMPLE: "Open Spotify", "Launch Terminal", "Hi", "Volume up", "Screenshot".
-ADVANCED: "Add this song to my likes", "Buy tide pods", "Check my physics homework on Canvas", "Translate the text on my screen".
-
-User said: "{user_text}"
-Output valid JSON: {{"complexity": "SIMPLE" | "ADVANCED"}}"""
+        async def run_agent_loop(user_text):
+            SENIOR_SYSTEM_PROMPT = "You control macOS via screenshots. Tools: open_url, click(x,y), keyboard_type, type_text, wait, press_hotkey, scroll. Output JSON: {'explanation': '...', 'command': '...', 'done': bool}"
+            conversation_history = [{"role": "system", "content": SENIOR_SYSTEM_PROMPT}]
+            try:
+                for step in range(MAX_AGENT_STEPS):
+                    current_screenshot = connection_state["latest_screenshot_b64"]
+                    if not current_screenshot: break
+                    annotated = annotate_screenshot(current_screenshot, last_data)
+                    user_content = [{"text": f"Task: {user_text}" if step == 0 else "Continue task."}, {"image": {"format": "png", "source": {"bytes": annotated}}}]
+                    conversation_history.append({"role": "user", "content": user_content})
                     
-                    try:
-                        routing_completion = await openrouter_client.chat.completions.create(
-                            model="nvidia/nemotron-3-super-120b-a12b:free",
-                            messages=[{"role": "system", "content": routing_prompt}],
-                            response_format={"type": "json_object"}
-                        )
-                        routing_data = json.loads(routing_completion.choices[0].message.content)
-                        complexity = routing_data.get("complexity", "SIMPLE").strip().upper()
-                        logger.info(f"Routing Decision: {complexity}")
-                    except Exception as e:
-                        logger.error(f"Routing Error: {e}")
-                        complexity = "SIMPLE"
+                    # Bedrock call
+                    body = json.dumps({
+                        "system": [{"text": SENIOR_SYSTEM_PROMPT}],
+                        "messages": [h for h in conversation_history if h["role"] != "system"],
+                        "inferenceConfig": {"max_tokens": 1024, "temperature": 0.2}
+                    })
+                    response = bedrock_runtime.invoke_model(modelId=NOVA_PRO_MODEL_ID, body=body)
+                    raw_content = json.loads(response.get('body').read())['output']['message']['content'][0]['text']
+                    conversation_history.append({"role": "assistant", "content": [{"text": raw_content}]})
+                    
+                    data = json.loads(raw_content[raw_content.find('{'):raw_content.rfind('}')+1])
+                    cmd = data.get("command")
+                    if cmd and cmd != "none":
+                        await websocket.send_text(json.dumps(data))
+                        await asyncio.sleep(ACTION_SETTLE_TIME)
+                    if data.get("done"): break
+                    
+                    connection_state["screenshot_event"].clear()
+                    await websocket.send_text(json.dumps({"command": "capture_screen"}))
+                    await asyncio.wait_for(connection_state["screenshot_event"].wait(), timeout=SCREENSHOT_TIMEOUT)
+            except Exception as e: logger.error(f"Agent error: {e}")
 
-                # STEP 2: Execution
-                if complexity == "SIMPLE":
-                    system_prompt = """You are the tool extractor. Output ONLY JSON.
-Example: "Open Safari" -> {"command": "type_text", "text": "Safari"}"""
-                    try:
-                        completion = await openrouter_client.chat.completions.create(
-                            model="nvidia/nemotron-3-super-120b-a12b:free",
-                            messages=[
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_text}
-                            ],
-                            response_format={"type": "json_object"}
-                        )
-                        return json.loads(completion.choices[0].message.content)
-                    except: return None
-                else:
-                    # ADVANCED: Launch multi-step agent loop
-                    asyncio.create_task(run_agent_loop(user_text))
-                    return None  # Agent loop handles sending commands directly
+        async def process_complete_transcription():
+            full_text = " ".join(connection_state["transcription_buffer"]).strip()
+            connection_state["transcription_buffer"] = []
+            if not full_text: return
+            logger.info(f"Processing: {full_text}")
+            action = await hybrid_reasoning(full_text, connection_state["latest_sight"], connection_state["latest_screenshot_b64"])
+            if action: await websocket.send_text(json.dumps(action))
 
-            async def run_agent_loop(user_text):
-                """Multi-step agentic loop: observe → think → act → repeat."""
-                if connection_state["agent_running"]:
-                    logger.warning("Agent loop already running, skipping.")
-                    return
-                connection_state["agent_running"] = True
-                
-                SENIOR_SYSTEM_PROMPT = """You are Sai's Advanced Brain. You control a macOS computer by looking at screenshots and executing actions step-by-step.
+        async def debounce_and_process():
+            await asyncio.sleep(1.5)
+            await process_complete_transcription()
 
-YOU CAN SEE THE SCREENSHOT. It has RED coordinate labels along the top (X-axis) and left (Y-axis) edges every 200 pixels. USE THESE to estimate click coordinates.
+        def on_message(self, result, **kwargs):
+            sentence = result.channel.alternatives[0].transcript
+            if sentence.strip():
+                connection_state["transcription_buffer"].append(sentence)
+                loop = asyncio.get_event_loop()
+                if connection_state["debounce_task"]: connection_state["debounce_task"].cancel()
+                connection_state["debounce_task"] = loop.create_task(debounce_and_process())
 
-TOOLS (always use the "command" key):
-1. open_url(url) - opens a URL in the default browser immediately. ALWAYS use this for web navigation.
-2. click(x, y) - clicks at exact pixel coordinates. Read the RED labels to estimate x and y precisely.
-3. keyboard_type(text) - types text into the CURRENTLY FOCUSED element on screen. Only works if something is already focused.
-4. type_text(text) - opens macOS Spotlight, types text, and launches it. Use only to open apps by name.
+        # Initialize Deepgram
+        deepgram = DeepgramClient(DEEPGRAM_API_KEY)
+        dg_connection = deepgram.listen.live.v("1")
+        dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+        dg_connection.start(LiveOptions(model="nova-2-general", language="en-US", encoding="linear16", channels=1, sample_rate=16000))
 
-CRITICAL RULES:
-- Output a SINGLE JSON object per response. No extra text, no markdown, no code fences.
-- Always include "explanation" and "done" in every response.
-- "done": false means more steps are coming. "done": true ONLY when you can confirm in the current screenshot that the task has been completed successfully.
-- NEVER set "done": true alongside a command that needs to be executed. If you still have an action to take, set "done": false.
-- After each step you will receive a FRESH screenshot of the result. Use it to decide your next action.
-- If keyboard_type fails (text doesn't appear), try clicking the target field first, then keyboard_type again.
-
-Examples:
-{"explanation": "Opening amazon.com directly", "command": "open_url", "url": "https://www.amazon.com", "done": false}
-{"explanation": "Amazon has loaded successfully, task is complete", "command": "none", "done": true}
-{"explanation": "Clicking search bar at ~(500, 130) based on grid", "command": "click", "x": 500, "y": 130, "done": false}"""
-                
-                conversation_history = [
-                    {"role": "system", "content": SENIOR_SYSTEM_PROMPT}
-                ]
-                
-                logger.info(f"========== AGENT LOOP STARTED for: '{user_text}' ==========")
-                
-                try:
-                    for step in range(MAX_AGENT_STEPS):
-                        # 1. Get current screenshot
-                        current_screenshot = connection_state["latest_screenshot_b64"]
-                        if not current_screenshot:
-                            logger.error("No screenshot available for agent loop.")
-                            break
-                        
-                        # 2. Annotate with grid
-                        annotated = annotate_screenshot(current_screenshot)
-                        
-                        # 3. Build user message with screenshot
-                        step_label = f"Step {step + 1}/{MAX_AGENT_STEPS}"
-                        if step == 0:
-                            user_content = [{"type": "text", "text": f"[{step_label}] Task: {user_text}"}, 
-                                           {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{annotated}"}}]
-                        else:
-                            user_content = [{"type": "text", "text": f"[{step_label}] Here is the updated screenshot after the previous action. Continue the task."}, 
-                                           {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{annotated}"}}]
-                        
-                        conversation_history.append({"role": "user", "content": user_content})
-                        
-                        # 4. Call Senior Brain
-                        try:
-                            completion = await openrouter_client.chat.completions.create(
-                                model="google/gemini-3-flash-preview",
-                                messages=conversation_history
-                            )
-                            raw_content = completion.choices[0].message.content
-                            logger.info(f"[Step {step + 1}] Senior Brain Response: {raw_content}")
-                            
-                            # Add assistant response to history
-                            conversation_history.append({"role": "assistant", "content": raw_content})
-                            
-                            # Parse — try to extract JSON from the response
-                            # Strip markdown code fences if present
-                            cleaned = raw_content.strip()
-                            if cleaned.startswith("```"):
-                                cleaned = cleaned.split("\n", 1)[-1]
-                                cleaned = cleaned.rsplit("```", 1)[0]
-                            
-                            data = json.loads(cleaned)
-                            if isinstance(data, list) and len(data) > 0:
-                                data = data[0]
-                            if "action" in data and "command" not in data:
-                                data["command"] = data["action"]
-                            
-                        except Exception as e:
-                            logger.error(f"[Step {step + 1}] Senior Brain Error: {e}")
-                            break
-                        
-                        # 5. Execute the command first (even if done, command may still need to run)
-                        cmd = data.get("command")
-                        if cmd and cmd != "none":
-                            logger.info(f"[Step {step + 1}] Executing: {data}")
-                            await websocket.send_text(json.dumps(data))
-                            # Wait for action to settle
-                            await asyncio.sleep(ACTION_SETTLE_TIME)
-                        
-                        # 6. Check if done AFTER executing
-                        if data.get("done") == True:
-                            logger.info(f"[Step {step + 1}] Agent reports DONE: {data.get('explanation', '')}")
-                            break
-                        
-                        if not cmd or cmd == "none":
-                            logger.info(f"[Step {step + 1}] No command and not done — breaking to avoid infinite loop.")
-                            break
-                        
-                        # 8. Request a fresh screenshot
-                        screenshot_event.clear()
-                        await websocket.send_text(json.dumps({"command": "capture_screen"}))
-                        
-                        # 9. Wait for the screenshot to arrive via upstream
-                        try:
-                            await asyncio.wait_for(screenshot_event.wait(), timeout=SCREENSHOT_TIMEOUT)
-                            logger.info(f"[Step {step + 1}] Fresh screenshot received.")
-                        except asyncio.TimeoutError:
-                            logger.error(f"[Step {step + 1}] Timed out waiting for screenshot.")
-                            break
-                    else:
-                        logger.warning(f"Agent loop hit max steps ({MAX_AGENT_STEPS}).")
-                
-                except Exception as e:
-                    logger.error(f"Agent loop error: {e}")
-                finally:
-                    connection_state["agent_running"] = False
-                    logger.info("========== AGENT LOOP ENDED ==========")
-
-            async def process_complete_transcription():
-                """Process the fully accumulated transcription buffer."""
-                full_text = "".join(connection_state["transcription_buffer"]).strip()
-                connection_state["transcription_buffer"] = []
-                connection_state["debounce_task"] = None
-                
-                if not full_text:
-                    return
-                
-                logger.info(f"=== COMPLETE TRANSCRIPTION: '{full_text}' ===")
-                
-                # ECHO SUPPRESSION
-                normalized_input = "".join(filter(str.isalnum, full_text.lower()))
-                is_echo = False
-                for reply in list(connection_state["recent_model_replies"]):
-                    normalized_reply = "".join(filter(str.isalnum, reply.lower()))
-                    if normalized_reply and (normalized_reply in normalized_input or normalized_input in normalized_reply):
-                        is_echo = True
-                        break
-                
-                if is_echo:
-                    logger.info(f"Ignored echo transcription: '{full_text}'")
-                    return
-                
-                logger.info(f"!!! TRIGGERING HYBRID BRAIN FOR: {full_text}")
-                try:
-                    action = await hybrid_reasoning(
-                        full_text, 
-                        connection_state["latest_sight"],
-                        connection_state["latest_screenshot_b64"]
-                    )
-                    if action and action.get("command") != "none":
-                        cmd = action.get("command")
-                        if cmd not in ["type_text", "capture_screen", "click", "open_url", "keyboard_type"]:
-                            logger.warning(f"Brain returned unknown command: {action}")
-                        
-                        if cmd == "type_text" and not action.get("text", "").strip():
-                            logger.info("Ignoring empty type_text command")
-                        else:
-                            logger.info(f"Forwarding action to client: {action}")
-                            await websocket.send_text(json.dumps(action))
-                except Exception as e:
-                    logger.error(f"Failed to process hybrid brain action: {e}")
-
-            async def debounce_and_process():
-                """Wait 1.5s of silence, then process the accumulated buffer."""
-                await asyncio.sleep(1.5)
-                await process_complete_transcription()
-
-            async def downstream():
-                """Google -> Client"""
-                try:
-                    async for message in google_ws:
-                        response = json.loads(message)
-                        
-                        if "setupComplete" in response:
-                            logger.info(">>> GEMINI SETUP CONFIRMED")
-                        
-                        # Handle goAway (server warning before disconnect)
-                        if "goAway" in response:
-                            time_left = response["goAway"].get("timeLeft", "unknown")
-                            logger.warning(f"Gemini goAway: session ending in {time_left}")
-                        
-                        if "serverContent" in response:
-                            model_turn = response["serverContent"].get("modelTurn")
-                            if model_turn:
-                                for part in model_turn.get("parts", []):
-
-                                    # Handle Audio
-                                    if "inlineData" in part:
-                                        audio_data_b64 = part["inlineData"].get("data")
-                                        if audio_data_b64:
-                                            audio_binary = base64.b64decode(audio_data_b64)
-                                            await websocket.send_bytes(audio_binary)
-                            
-                            # Handle Input Transcriptions (user speech → text)
-                            input_transcription = response["serverContent"].get("inputTranscription")
-                            if input_transcription:
-                                text = input_transcription.get("text", "")
-                                if text.strip():
-                                    logger.info(f"--- FRAGMENT: '{text}' (buffer: {''.join(connection_state['transcription_buffer'])}) ---")
-                                    
-                                    # Append fragment to buffer
-                                    connection_state["transcription_buffer"].append(text)
-                                    
-                                    # Cancel any pending debounce timer
-                                    if connection_state["debounce_task"]:
-                                        connection_state["debounce_task"].cancel()
-                                    
-                                    # Start a new 1.5s debounce timer
-                                    connection_state["debounce_task"] = asyncio.create_task(debounce_and_process())
-                            
-                            # Handle turnComplete — flush buffer immediately
-                            turn_complete = response["serverContent"].get("turnComplete", False)
-                            if turn_complete and connection_state["transcription_buffer"]:
-                                logger.info("Turn complete signal received, flushing buffer.")
-                                if connection_state["debounce_task"]:
-                                    connection_state["debounce_task"].cancel()
-                                await process_complete_transcription()
-                            
-                            # Handle Output Transcriptions (model speech → text)
-                            output_transcription = response["serverContent"].get("outputTranscription")
-                            if output_transcription:
-                                res_text = output_transcription.get("text", "")
-                                logger.info(f"OUTPUT TRANSCRIPTION: '{res_text}'")
-                                if res_text.strip():
-                                    connection_state["recent_model_replies"].append(res_text)
-                                    # If Gemini is describing the screen, update latest_sight
-                                    keywords = ["screen", "visible", "browser", "windows", "desktop", "here is", "i see"]
-                                    if any(k in res_text.lower() for k in keywords):
-                                        logger.info(f"Updating Visual Context: {res_text}")
-                                        connection_state["latest_sight"] = res_text
-                            
-                            # Log tool calls if model tries them anyway
-                            if model_turn:
-                                for part in model_turn.get("parts", []):
-                                    if "functionCall" in part:
-                                        logger.warning(f"MODEL TRIED ToolCall (Ignoring): {part['functionCall']}")
-                            
-                            interruption = response["serverContent"].get("interruption")
-                            if interruption:
-                                logger.info("User interrupted Gemini, stopping audio...")
-                                # Optional: Clear audio queue on client if implemented
-
-                except websockets.exceptions.ConnectionClosed as e:
-                    logger.info(f"Gemini disconnected (downstream) code={e.code} reason='{e.reason}'")
-                except WebSocketDisconnect:
-                    logger.info("Client disconnected (downstream)")
-                except Exception as e:
-                    logger.error(f"Error in downstream: {e}")
-                finally:
-                    if not websocket.client_state.name == "DISCONNECTED":
-                        try:
-                            await websocket.close()
-                        except RuntimeError:
-                            pass
-
-            # Run both loops concurrently. If one exits, the other should be cancelled.
-            upstream_task = asyncio.create_task(upstream())
-            downstream_task = asyncio.create_task(downstream())
-            
-            done, pending = await asyncio.wait(
-                [upstream_task, downstream_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            
-            for task in pending:
-                task.cancel()
-                
-    except websockets.exceptions.ConnectionClosed as e:
-        logger.info(f"Google Gemini connection closed: code={e.code} reason='{e.reason}'")
-    except WebSocketDisconnect:
-        logger.info("Connection closed by client")
-    except Exception as e:
-        logger.error(f"Unexpected error in session: {e}")
-
+        while True:
+            message = await websocket.receive()
+            if message.get("bytes"):
+                dg_connection.send(message.get("bytes"))
+            elif message.get("text"):
+                data = json.loads(message["text"])
+                if data.get("event") == "screen_captured":
+                    connection_state["latest_screenshot_b64"] = data.get("image_base64")
+                    connection_state["screenshot_event"].set()
+    except Exception as e: logger.error(f"WebSocket error: {e}")
     finally:
+        if 'dg_connection' in locals(): dg_connection.finish()
         logger.info("Session ended")
 
 if __name__ == "__main__":
