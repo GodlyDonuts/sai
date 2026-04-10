@@ -1,5 +1,7 @@
 # Sai — Voice-Native Agentic OS Co-Pilot
 
+![Demo GIF](demo.gif)
+
 ### Your computer can finally see. Your voice is the only interface you need.
 
 > *"Hey Sai, answer this LeetCode problem."*
@@ -248,6 +250,34 @@ Nova Pro's multimodal capabilities are the foundation of Sai's intelligence. It 
 
 ---
 
+## macOS Permissions & Troubleshooting
+
+> **Sai will not function without these three permissions granted to your Terminal or IDE.** macOS sandboxing blocks microphone access, screen capture, and UI automation by default.
+
+### Required Permissions
+
+Go to **System Settings → Privacy & Security** and enable the following for your terminal application (Terminal, iTerm2, VS Code, etc.):
+
+| Permission | Path | Required For |
+|---|---|---|
+| **Accessibility** | Privacy & Security → Accessibility | Mouse clicks, keyboard input, hotkeys (PyAutoGUI) |
+| **Screen Recording** | Privacy & Security → Screen Recording | Screenshot capture (`screencapture` command) |
+| **Microphone** | Privacy & Security → Microphone | Wake word detection and audio streaming (PyAudio) |
+
+### If macOS Doesn't Prompt You Automatically
+
+macOS sometimes silently denies permissions without showing a dialog (especially after app reinstalls). To force a fresh permission prompt, reset each permission from Terminal:
+
+```bash
+tccutil reset Accessibility
+tccutil reset ScreenCapture
+tccutil reset Microphone
+```
+
+After running these commands, **fully quit and relaunch your terminal**, then run the app again — macOS will now prompt for each permission.
+
+---
+
 ## Setup & Reproducibility
 
 ### Prerequisites
@@ -256,41 +286,64 @@ Nova Pro's multimodal capabilities are the foundation of Sai's intelligence. It 
 - Picovoice Access Key — [picovoice.ai](https://picovoice.ai/)
 - ElevenLabs API Key — [elevenlabs.io](https://elevenlabs.io/)
 - Amazon Nova API Key — via AWS Bedrock or API proxy
-- Microphone + Screen Recording permissions granted in System Preferences
 
-### 1. Server
+### Automated Setup (Recommended)
+
+Run the one-shot setup script from the repo root:
 
 ```bash
-cd server
-pip install -r requirements.txt
+bash setup_mac.sh
 ```
 
-Create `server/.env`:
-```env
+This will:
+1. Verify Python 3.11+ is installed
+2. Create isolated `venv` environments inside `client/` and `server/`
+3. Install all dependencies from `requirements.txt`
+4. Copy `.env.example` → `.env` in both directories, prompting you to fill in your API keys
+
+Then fill in your keys:
+
+```bash
+# server/.env
 AMAZON_NOVA_API_KEY=your_key
 NOVA_BASE_URL=https://api.nova.amazon.com/v1
 OPENROUTER_API_KEY=your_key
 ELEVENLABS_API_KEY=your_key
-```
 
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8080
-```
-
-### 2. Client
-
-```bash
-cd client
-pip install -r requirements.txt
-```
-
-Create `client/.env`:
-```env
+# client/.env
 PICOVOICE_ACCESS_KEY=your_key
 ```
 
+### Manual Setup
+
+<details>
+<summary>Expand for manual step-by-step instructions</summary>
+
+**Server:**
 ```bash
-python wake_word.py
+cd server
+python3.11 -m venv venv
+venv/bin/pip install -r requirements.txt
+cp .env.example .env   # then edit .env with your keys
+```
+
+**Client:**
+```bash
+cd client
+python3.11 -m venv venv
+venv/bin/pip install -r requirements.txt
+cp .env.example .env   # then edit .env with your Picovoice key
+```
+</details>
+
+### Running Sai
+
+```bash
+# Terminal 1 — start the server
+cd server && venv/bin/uvicorn main:app --host 0.0.0.0 --port 8080
+
+# Terminal 2 — start the client
+cd client && venv/bin/python wake_word.py
 ```
 
 ### 3. Use It

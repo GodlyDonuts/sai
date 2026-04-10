@@ -1,0 +1,1012 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sai — Voice-Native Agentic OS Co-Pilot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,400;0,500;0,700;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #06060e;
+  --surface: #0e0e1a;
+  --surface2: #161628;
+  --text: #e8e8f0;
+  --text-muted: #7b7b9e;
+  --accent: #0ea5e9;
+  --accent2: #e94560;
+  --accent3: #a855f7;
+  --gradient: linear-gradient(135deg, #0ea5e9, #a855f7, #e94560);
+  --gradient-text: linear-gradient(135deg, #38bdf8, #c084fc, #f472b6);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+}
+
+.deck {
+  width: 100%; height: 100%;
+  position: relative;
+}
+
+.slide {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 60px 80px;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.5s ease, transform 0.5s ease;
+  transform: translateX(40px);
+}
+.slide.active {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(0);
+}
+.slide.exiting {
+  opacity: 0;
+  transform: translateX(-40px);
+}
+
+.slide-inner {
+  max-width: 1200px;
+  width: 100%;
+}
+
+h1 {
+  font-family: 'Syne', sans-serif;
+  font-weight: 800;
+  line-height: 1.05;
+}
+h2 {
+  font-family: 'Syne', sans-serif;
+  font-weight: 700;
+  line-height: 1.15;
+}
+h3 {
+  font-family: 'Syne', sans-serif;
+  font-weight: 600;
+}
+
+.gradient-text {
+  background: var(--gradient-text);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ── NAV ── */
+.nav {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 32px;
+  z-index: 100;
+  background: rgba(6,6,14,0.8);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid rgba(255,255,255,0.04);
+}
+.progress-track {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: rgba(255,255,255,0.06);
+}
+.progress-bar {
+  height: 100%;
+  background: var(--gradient);
+  transition: width 0.4s ease;
+}
+.nav-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+.nav-arrows {
+  display: flex; gap: 8px;
+}
+.nav-arrows button {
+  width: 32px; height: 32px;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.2s;
+}
+.nav-arrows button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(14,165,233,0.08);
+}
+
+/* ── TITLE SLIDE ── */
+.title-slide {
+  text-align: center;
+  position: relative;
+}
+.title-slide .overline {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 24px;
+}
+.title-slide h1 {
+  font-size: clamp(80px, 12vw, 160px);
+  letter-spacing: -3px;
+}
+.title-slide .subtitle {
+  font-size: clamp(18px, 2.5vw, 28px);
+  color: var(--text-muted);
+  margin-top: 16px;
+  font-weight: 400;
+}
+.title-slide .author {
+  margin-top: 48px;
+  font-size: 15px;
+  color: var(--text-muted);
+}
+.title-slide .author strong {
+  color: var(--text);
+}
+.title-glow {
+  position: absolute;
+  width: 500px; height: 500px;
+  border-radius: 50%;
+  filter: blur(120px);
+  opacity: 0.15;
+  pointer-events: none;
+}
+.title-glow.blue { background: var(--accent); top: -100px; left: 10%; }
+.title-glow.pink { background: var(--accent2); bottom: -100px; right: 10%; }
+.title-glow.purple { background: var(--accent3); top: 50%; left: 50%; transform: translate(-50%,-50%); }
+
+/* ── STATEMENT SLIDE ── */
+.statement {
+  text-align: center;
+}
+.statement h2 {
+  font-size: clamp(36px, 5vw, 72px);
+  max-width: 900px;
+}
+.statement p {
+  font-size: clamp(16px, 1.8vw, 22px);
+  color: var(--text-muted);
+  max-width: 700px;
+  margin-top: 24px;
+  line-height: 1.6;
+}
+
+/* ── COMPARISON TABLE ── */
+.compare-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 32px;
+  margin-top: 48px;
+  width: 100%;
+}
+.compare-col {
+  background: var(--surface);
+  border-radius: 16px;
+  padding: 36px;
+  border: 1px solid rgba(255,255,255,0.05);
+}
+.compare-col.bad { border-top: 3px solid var(--accent2); }
+.compare-col.good { border-top: 3px solid #10b981; }
+.compare-col h3 {
+  font-size: 20px;
+  margin-bottom: 20px;
+}
+.compare-col.bad h3 { color: var(--accent2); }
+.compare-col.good h3 { color: #10b981; }
+.compare-col ul {
+  list-style: none;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.compare-col ul li {
+  font-size: 16px;
+  color: var(--text-muted);
+  padding-left: 28px;
+  position: relative;
+  line-height: 1.5;
+}
+.compare-col.bad ul li::before { content: '✗'; position: absolute; left: 0; color: var(--accent2); font-weight: 700; }
+.compare-col.good ul li::before { content: '✓'; position: absolute; left: 0; color: #10b981; font-weight: 700; }
+
+/* ── FLOW DIAGRAM ── */
+.flow {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin-top: 48px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.flow-step {
+  background: var(--surface);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 14px;
+  padding: 24px 28px;
+  text-align: center;
+  min-width: 160px;
+  position: relative;
+}
+.flow-step .step-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--accent);
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+.flow-step .step-icon {
+  font-size: 28px;
+  margin-bottom: 8px;
+}
+.flow-step h4 {
+  font-family: 'Syne', sans-serif;
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.flow-step p {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.flow-arrow {
+  font-size: 24px;
+  color: var(--text-muted);
+  padding: 0 8px;
+  flex-shrink: 0;
+}
+
+/* ── ARCH DIAGRAM ── */
+.arch-container {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 24px;
+  align-items: start;
+  margin-top: 40px;
+  width: 100%;
+}
+.arch-box {
+  background: var(--surface);
+  border-radius: 16px;
+  padding: 28px;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+.arch-box h4 {
+  font-family: 'Syne', sans-serif;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  margin-bottom: 20px;
+}
+.arch-box.client-box { border-left: 3px solid #10b981; }
+.arch-box.client-box h4 { color: #10b981; }
+.arch-box.server-box { border-left: 3px solid var(--accent); }
+.arch-box.server-box h4 { color: var(--accent); }
+.arch-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  font-size: 14px;
+}
+.arch-item:last-child { border-bottom: none; }
+.arch-item .dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.arch-item .label { color: var(--text); font-weight: 500; }
+.arch-item .tech { color: var(--text-muted); font-size: 13px; }
+.arch-connector {
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 12px;
+  padding-top: 40px;
+}
+.arch-connector .conn-line {
+  width: 2px; height: 40px;
+  background: linear-gradient(to bottom, rgba(14,165,233,0.4), rgba(233,69,96,0.4));
+}
+.arch-connector .conn-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  writing-mode: vertical-lr;
+  text-orientation: mixed;
+}
+
+/* ── AGENT LOOP ── */
+.loop-visual {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  margin-top: 48px;
+}
+.loop-node {
+  width: 180px;
+  padding: 28px 20px;
+  border-radius: 16px;
+  text-align: center;
+  position: relative;
+}
+.loop-node.plan { background: linear-gradient(135deg, rgba(245,158,11,0.15), rgba(245,158,11,0.05)); border: 1px solid rgba(245,158,11,0.3); }
+.loop-node.act  { background: linear-gradient(135deg, rgba(14,165,233,0.15), rgba(14,165,233,0.05)); border: 1px solid rgba(14,165,233,0.3); }
+.loop-node.verify { background: linear-gradient(135deg, rgba(16,185,129,0.15), rgba(16,185,129,0.05)); border: 1px solid rgba(16,185,129,0.3); }
+.loop-node .node-icon { font-size: 32px; margin-bottom: 10px; }
+.loop-node h4 { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+.loop-node.plan h4 { color: #f59e0b; }
+.loop-node.act h4 { color: var(--accent); }
+.loop-node.verify h4 { color: #10b981; }
+.loop-node p { font-size: 13px; color: var(--text-muted); line-height: 1.4; }
+.loop-arrow {
+  font-size: 28px;
+  color: rgba(255,255,255,0.2);
+  padding: 0 16px;
+}
+.loop-return {
+  position: absolute;
+  bottom: -48px; left: 50%;
+  transform: translateX(-50%);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--accent2);
+  white-space: nowrap;
+  letter-spacing: 0.5px;
+}
+
+/* ── NOVA TABLE ── */
+.nova-table {
+  width: 100%;
+  margin-top: 40px;
+  border-collapse: separate;
+  border-spacing: 0 8px;
+}
+.nova-table th {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  color: var(--text-muted);
+  text-align: left;
+  padding: 8px 20px;
+}
+.nova-table td {
+  padding: 16px 20px;
+  background: var(--surface);
+  font-size: 15px;
+}
+.nova-table tr td:first-child { border-radius: 12px 0 0 12px; font-weight: 600; color: var(--accent); }
+.nova-table tr td:last-child { border-radius: 0 12px 12px 0; color: var(--text-muted); }
+.nova-table .model-tag {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  font-weight: 500;
+}
+.nova-table .tag-lite { background: rgba(14,165,233,0.12); color: var(--accent); }
+.nova-table .tag-pro { background: rgba(168,85,247,0.12); color: var(--accent3); }
+
+/* ── INNOVATION CARDS ── */
+.innovation-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+  margin-top: 40px;
+}
+.inno-card {
+  background: var(--surface);
+  border: 1px solid rgba(255,255,255,0.05);
+  border-radius: 16px;
+  padding: 28px;
+  transition: border-color 0.3s;
+}
+.inno-card:hover {
+  border-color: rgba(14,165,233,0.3);
+}
+.inno-card .card-icon {
+  font-size: 28px;
+  margin-bottom: 14px;
+}
+.inno-card h4 {
+  font-family: 'Syne', sans-serif;
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.inno-card p {
+  font-size: 14px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* ── IMPACT SLIDE ── */
+.impact-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 24px;
+  margin-top: 48px;
+}
+.impact-item {
+  text-align: center;
+  padding: 32px;
+}
+.impact-item .impact-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+.impact-item h4 {
+  font-family: 'Syne', sans-serif;
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+.impact-item p {
+  font-size: 15px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* ── DEMO SLIDE ── */
+.demo-slide {
+  text-align: center;
+}
+.demo-box {
+  margin-top: 40px;
+  padding: 60px;
+  border: 2px dashed rgba(255,255,255,0.1);
+  border-radius: 20px;
+  background: var(--surface);
+}
+.demo-box p {
+  color: var(--text-muted);
+  font-size: 18px;
+}
+.demo-examples {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+  margin-top: 32px;
+  flex-wrap: wrap;
+}
+.demo-chip {
+  padding: 10px 20px;
+  border-radius: 100px;
+  border: 1px solid rgba(255,255,255,0.08);
+  background: var(--surface2);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.demo-chip::before {
+  content: '"';
+  color: var(--accent);
+}
+.demo-chip::after {
+  content: '"';
+  color: var(--accent);
+}
+
+/* ── CLOSING ── */
+.closing-slide {
+  text-align: center;
+}
+.closing-slide .hashtag {
+  font-family: 'Syne', sans-serif;
+  font-size: clamp(24px, 3vw, 36px);
+  font-weight: 700;
+  color: var(--accent);
+  margin-top: 32px;
+}
+.closing-slide .links {
+  display: flex;
+  gap: 24px;
+  justify-content: center;
+  margin-top: 32px;
+}
+.closing-slide .links a {
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 15px;
+  padding: 10px 24px;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  transition: all 0.2s;
+}
+.closing-slide .links a:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ── GUARDRAIL BADGES ── */
+.guardrail-row {
+  display: flex;
+  gap: 12px;
+  margin-top: 32px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.guardrail-badge {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  background: rgba(233,69,96,0.08);
+  border: 1px solid rgba(233,69,96,0.2);
+  font-size: 13px;
+  color: var(--accent2);
+  font-weight: 500;
+}
+.guardrail-badge .badge-icon { font-size: 16px; }
+
+/* ── RESPONSIVE ── */
+@media (max-width: 900px) {
+  .slide { padding: 32px 24px; }
+  .compare-grid, .arch-container { grid-template-columns: 1fr; }
+  .innovation-grid, .impact-grid { grid-template-columns: 1fr; }
+  .flow { flex-direction: column; }
+  .flow-arrow { transform: rotate(90deg); }
+  .loop-visual { flex-direction: column; }
+  .loop-arrow { transform: rotate(90deg); }
+  .arch-connector { display: none; }
+}
+
+/* ── SLIDE ENTRY ANIMATIONS ── */
+.slide.active .slide-inner > * {
+  animation: fadeUp 0.5s ease both;
+}
+.slide.active .slide-inner > *:nth-child(1) { animation-delay: 0.05s; }
+.slide.active .slide-inner > *:nth-child(2) { animation-delay: 0.12s; }
+.slide.active .slide-inner > *:nth-child(3) { animation-delay: 0.19s; }
+.slide.active .slide-inner > *:nth-child(4) { animation-delay: 0.26s; }
+.slide.active .slide-inner > *:nth-child(5) { animation-delay: 0.33s; }
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+</style>
+</head>
+<body>
+
+<div class="deck" id="deck">
+
+  <!-- ═══════════════ SLIDE 1: TITLE ═══════════════ -->
+  <div class="slide active" data-slide="0">
+    <div class="title-glow blue"></div>
+    <div class="title-glow pink"></div>
+    <div class="title-glow purple"></div>
+    <div class="slide-inner title-slide">
+      <div class="overline">Amazon Nova AI Hackathon 2026</div>
+      <h1 class="gradient-text">SAI</h1>
+      <p class="subtitle">Voice-Native Agentic OS Co-Pilot</p>
+      <p class="author">Built by <strong>Saicharan Ramineni</strong></p>
+    </div>
+  </div>
+
+  <!-- ═══════════════ SLIDE 2: THE PROBLEM ═══════════════ -->
+  <div class="slide" data-slide="1">
+    <div class="slide-inner statement">
+      <h2>Your voice assistant is <span class="gradient-text">blind.</span></h2>
+      <p>It can set a timer, play a song, and tell you the weather. But it has zero awareness of the browser tab you have open, the form you're filling, or the code you're writing. It cannot <em>see</em> your screen.</p>
+    </div>
+  </div>
+
+  <!-- ═══════════════ SLIDE 3: THE GAP ═══════════════ -->
+  <div class="slide" data-slide="2">
+    <div class="slide-inner">
+      <h2 style="text-align:center; font-size: clamp(28px,4vw,48px);">The landscape today</h2>
+      <div class="compare-grid">
+        <div class="compare-col bad">
+          <h3>Voice Assistants</h3>
+          <ul>
+            <li>Can't see your screen</li>
+            <li>Limited to pre-built "skills"</li>
+            <li>No multi-step workflows</li>
+            <li>No awareness of current app context</li>
+          </ul>
+        </div>
+        <div class="compare-col bad">
+          <h3>UI Automation (RPA)</h3>
+          <ul>
+            <li>Relies on DOM selectors and XPaths</li>
+            <li>Breaks when UIs change</li>
+            <li>Hard-coded, not intelligent</li>
+            <li>No natural language interface</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ SLIDE 4: THE SOLUTION ═══════════════ -->
+  <div class="slide" data-slide="3">
+    <div class="slide-inner statement">
+      <h2>Sai <span class="gradient-text">sees</span> your screen.<br/>Your voice is the only interface.</h2>
+      <p>Sai combines real-time speech recognition with Amazon Nova's multimodal vision to operate your entire macOS desktop — any app, any website, any workflow — through natural voice commands. No APIs. No DOM. Pure visual reasoning.</p>
+    </div>
+  </div>
+
+  <!-- ═══════════════ SLIDE 5: DEMO ═══════════════ -->
+  <div class="slide" data-slide="4">
+    <div class="slide-inner demo-slide">
+      <h2 style="font-size: clamp(32px,4vw,56px);">Live Demo</h2>
+      <div class="demo-box">
+        <p>Switch to the live demo</p>
+      </div>
+      <div class="demo-examples">
+        <div class="demo-chip">Hey Sai, open Spotify</div>
+        <div class="demo-chip">Hey Sai, answer this LeetCode problem</div>
+        <div class="demo-chip">Hey Sai, turn off data sharing on Twitter</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ SLIDE 6: END-TO-END FLOW ═══════════════ -->
+  <div class="slide" data-slide="5">
+    <div class="slide-inner">
+      <h2 style="text-align:center; font-size: clamp(28px,4vw,44px);">How it works</h2>
+      <div class="flow">
+        <div class="flow-step">
+          <div class="step-num">Step 1</div>
+          <div class="step-icon">🎤</div>
+          <h4>Wake Word</h4>
+          <p>Picovoice Porcupine<br/>detects "Hey Sai"</p>
+        </div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step">
+          <div class="step-num">Step 2</div>
+          <div class="step-icon">🗣️</div>
+          <h4>Transcribe</h4>
+          <p>ElevenLabs Scribe v2<br/>realtime streaming</p>
+        </div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step">
+          <div class="step-num">Step 3</div>
+          <div class="step-icon">🧠</div>
+          <h4>Interpret & Route</h4>
+          <p>Nova 2 Lite<br/>fixes STT + classifies</p>
+        </div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step">
+          <div class="step-num">Step 4</div>
+          <div class="step-icon">👁️</div>
+          <h4>Vision Agent</h4>
+          <p>Nova Pro reasons<br/>over screenshots</p>
+        </div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step">
+          <div class="step-num">Step 5</div>
+          <div class="step-icon">🖱️</div>
+          <h4>Execute</h4>
+          <p>PyAutoGUI performs<br/>OS-level actions</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ SLIDE 7: ARCHITECTURE ═══════════════ -->
+  <div class="slide" data-slide="6">
+    <div class="slide-inner">
+      <h2 style="text-align:center; font-size: clamp(28px,4vw,44px);">Multi-Model Architecture</h2>
+      <div class="arch-container">
+        <div class="arch-box client-box">
+          <h4>Client (macOS)</h4>
+          <div class="arch-item">
+            <div class="dot" style="background:#10b981"></div>
+            <div>
+              <div class="label">Wake Word Engine</div>
+              <div class="tech">Picovoice Porcupine — offline, on-device</div>
+            </div>
+          </div>
+          <div class="arch-item">
+            <div class="dot" style="background:#10b981"></div>
+            <div>
+              <div class="label">Screen Capture</div>
+              <div class="tech">screencapture + Pillow LANCZOS → 1440×900</div>
+            </div>
+          </div>
+          <div class="arch-item">
+            <div class="dot" style="background:#10b981"></div>
+            <div>
+              <div class="label">App Context</div>
+              <div class="tech">AppleScript — app name, browser URL, tab title</div>
+            </div>
+          </div>
+          <div class="arch-item">
+            <div class="dot" style="background:#10b981"></div>
+            <div>
+              <div class="label">OS Executor</div>
+              <div class="tech">PyAutoGUI — click, type, scroll, hotkey</div>
+            </div>
+          </div>
+          <div class="arch-item">
+            <div class="dot" style="background:#10b981"></div>
+            <div>
+              <div class="label">Activity Overlay</div>
+              <div class="tech">NSPanel — animated border feedback</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="arch-connector">
+          <div class="conn-label">WebSocket</div>
+          <div class="conn-line"></div>
+          <div style="font-size:20px; color: var(--text-muted);">⇄</div>
+          <div class="conn-line"></div>
+          <div class="conn-label">Bidirectional</div>
+        </div>
+
+        <div class="arch-box server-box">
+          <h4>Server (Cloud)</h4>
+          <div class="arch-item">
+            <div class="dot" style="background:var(--accent)"></div>
+            <div>
+              <div class="label">STT Pipeline</div>
+              <div class="tech">ElevenLabs Scribe v2 — realtime VAD streaming</div>
+            </div>
+          </div>
+          <div class="arch-item">
+            <div class="dot" style="background:var(--accent)"></div>
+            <div>
+              <div class="label">Intent Interpreter</div>
+              <div class="tech">Nova 2 Lite — garbled speech correction</div>
+            </div>
+          </div>
+          <div class="arch-item">
+            <div class="dot" style="background:var(--accent)"></div>
+            <div>
+              <div class="label">Task Router</div>
+              <div class="tech">Nova 2 Lite — SIMPLE vs ADVANCED classifier</div>
+            </div>
+          </div>
+          <div class="arch-item">
+            <div class="dot" style="background:var(--accent3)"></div>
+            <div>
+              <div class="label">Vision Agent Loop</div>
+              <div class="tech">Nova Pro — multimodal screenshot reasoning</div>
+            </div>
+          </div>
+          <div class="arch-item">
+            <div class="dot" style="background:var(--accent)"></div>
+            <div>
+              <div class="label">Gateway</div>
+              <div class="tech">FastAPI — async WebSocket server</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ SLIDE 8: AGENT LOOP ═══════════════ -->
+  <div class="slide" data-slide="7">
+    <div class="slide-inner" style="text-align:center;">
+      <h2 style="font-size: clamp(28px,4vw,44px);">The Vision Agent Loop</h2>
+      <p style="color: var(--text-muted); font-size: 17px; margin-top: 8px;">
+        Every complex task follows a disciplined Plan → Act → Verify cycle
+      </p>
+      <div class="loop-visual">
+        <div class="loop-node plan">
+          <div class="node-icon">📋</div>
+          <h4>Plan</h4>
+          <p>Analyze screenshot.<br/>Form numbered strategy.<br/>Explain reasoning.</p>
+        </div>
+        <div class="loop-arrow">→</div>
+        <div class="loop-node act">
+          <div class="node-icon">⚡</div>
+          <h4>Act</h4>
+          <p>Execute ONE action.<br/>Click, type, scroll.<br/>Wait for UI to settle.</p>
+        </div>
+        <div class="loop-arrow">→</div>
+        <div class="loop-node verify" style="position:relative;">
+          <div class="node-icon">✅</div>
+          <h4>Verify</h4>
+          <p>Capture fresh screenshot.<br/>Confirm action succeeded.<br/>Continue or finish.</p>
+          <div class="loop-return">↩ loop until done=true (up to 25 steps)</div>
+        </div>
+      </div>
+      <div class="guardrail-row">
+        <div class="guardrail-badge"><span class="badge-icon">🔄</span> Cycle Detection</div>
+        <div class="guardrail-badge"><span class="badge-icon">🛡️</span> Stuck Recovery</div>
+        <div class="guardrail-badge"><span class="badge-icon">🚫</span> Hard Bail</div>
+        <div class="guardrail-badge"><span class="badge-icon">🔒</span> Verification Gate</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ SLIDE 9: NOVA INTEGRATION ═══════════════ -->
+  <div class="slide" data-slide="8">
+    <div class="slide-inner">
+      <h2 style="text-align:center; font-size: clamp(28px,4vw,44px);">Amazon Nova Integration</h2>
+      <table class="nova-table">
+        <thead>
+          <tr>
+            <th>Component</th>
+            <th>Model</th>
+            <th>Capability</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Intent Interpreter</td>
+            <td><span class="model-tag tag-lite">Nova 2 Lite</span></td>
+            <td>Text reasoning — corrects garbled STT using screen context clues</td>
+          </tr>
+          <tr>
+            <td>Task Router</td>
+            <td><span class="model-tag tag-lite">Nova 2 Lite</span></td>
+            <td>Classification — SIMPLE (instant) vs ADVANCED (agent loop)</td>
+          </tr>
+          <tr>
+            <td>Simple Executor</td>
+            <td><span class="model-tag tag-lite">Nova 2 Lite</span></td>
+            <td>Structured output — natural language → executable JSON command</td>
+          </tr>
+          <tr>
+            <td>Vision Agent</td>
+            <td><span class="model-tag tag-pro">Nova Pro</span></td>
+            <td>Multimodal — screenshot analysis, spatial reasoning, action planning</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ═══════════════ SLIDE 10: INNOVATIONS ═══════════════ -->
+  <div class="slide" data-slide="9">
+    <div class="slide-inner">
+      <h2 style="text-align:center; font-size: clamp(28px,4vw,44px);">Key Technical Innovations</h2>
+      <div class="innovation-grid">
+        <div class="inno-card">
+          <div class="card-icon">📐</div>
+          <h4>Resolution Independence</h4>
+          <p>Normalized [0,1000]² coordinate space. Works on any display — 13" MacBook to 27" Studio Display — without recalibration.</p>
+        </div>
+        <div class="inno-card">
+          <div class="card-icon">🔄</div>
+          <h4>Cycle-Aware Stuck Detection</h4>
+          <p>Detects repeating action patterns of any length (1-6), injects corrective prompts, and hard-bails after 3× repetition.</p>
+        </div>
+        <div class="inno-card">
+          <div class="card-icon">⚡</div>
+          <h4>Hybrid Model Routing</h4>
+          <p>Three-tier Nova hierarchy. Simple commands resolve in &lt;1s via Lite. Complex tasks use Pro's full vision loop.</p>
+        </div>
+        <div class="inno-card">
+          <div class="card-icon">🎯</div>
+          <h4>Edge Ruler Annotation</h4>
+          <p>Minimal tick marks along screen edges give spatial reference without cluttering the screenshot the model sees.</p>
+        </div>
+        <div class="inno-card">
+          <div class="card-icon">📸</div>
+          <h4>Conversation Windowing</h4>
+          <p>Sliding window over history keeps system prompt + initial plan + recent 3 exchanges. Older screenshots pruned to maintain focus.</p>
+        </div>
+        <div class="inno-card">
+          <div class="card-icon">✨</div>
+          <h4>Native macOS Overlay</h4>
+          <p>Custom NSPanel with animated borders across all Spaces. Self-suspends during capture so the agent never sees its own UI.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ SLIDE 11: IMPACT ═══════════════ -->
+  <div class="slide" data-slide="10">
+    <div class="slide-inner">
+      <h2 style="text-align:center; font-size: clamp(28px,4vw,44px);">Why it matters</h2>
+      <div class="impact-grid">
+        <div class="impact-item">
+          <div class="impact-icon">♿</div>
+          <h4>Accessibility</h4>
+          <p>Transforms every app on macOS into a voice-controlled interface for users with motor disabilities. Not just supported apps — <em>every</em> app.</p>
+        </div>
+        <div class="impact-item">
+          <div class="impact-icon">🔁</div>
+          <h4>Resilient Automation</h4>
+          <p>Traditional RPA breaks when UIs change. Sai's visual approach adapts — it doesn't care if a button moved 50 pixels or a page redesigned.</p>
+        </div>
+        <div class="impact-item">
+          <div class="impact-icon">🚀</div>
+          <h4>Future of HCI</h4>
+          <p>Multimodal AI + real-time voice creates an interaction paradigm where the keyboard is optional and the mouse is agentic.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ SLIDE 12: CLOSING ═══════════════ -->
+  <div class="slide" data-slide="11">
+    <div class="title-glow blue"></div>
+    <div class="title-glow pink"></div>
+    <div class="slide-inner closing-slide">
+      <h2 style="font-size: clamp(32px,5vw,64px);">Stop typing.<br/><span class="gradient-text">Start speaking.</span></h2>
+      <div class="hashtag">#AmazonNova</div>
+      <p style="color: var(--text-muted); margin-top: 24px; font-size: 17px;">Saicharan Ramineni</p>
+      <div class="links">
+        <a href="https://github.com/saicharan-r/sai">GitHub Repository</a>
+        <a href="https://amazon-nova.devpost.com/">Amazon Nova Hackathon</a>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- NAV BAR -->
+<div class="nav">
+  <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+  <span class="nav-label" id="slideCounter">1 / 12</span>
+  <div class="nav-arrows">
+    <button onclick="prev()" aria-label="Previous">←</button>
+    <button onclick="next()" aria-label="Next">→</button>
+  </div>
+</div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+const total = slides.length;
+let current = 0;
+
+function goTo(n) {
+  if (n < 0 || n >= total || n === current) return;
+  const old = slides[current];
+  old.classList.remove('active');
+  old.classList.add('exiting');
+  setTimeout(() => old.classList.remove('exiting'), 500);
+
+  current = n;
+  slides[current].classList.add('active');
+
+  document.getElementById('slideCounter').textContent = `${current + 1} / ${total}`;
+  document.getElementById('progressBar').style.width = `${((current + 1) / total) * 100}%`;
+}
+
+function next() { goTo(current + 1); }
+function prev() { goTo(current - 1); }
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); next(); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); prev(); }
+  if (e.key === 'Home') { e.preventDefault(); goTo(0); }
+  if (e.key === 'End') { e.preventDefault(); goTo(total - 1); }
+});
+
+// Touch swipe support
+let touchStartX = 0;
+document.addEventListener('touchstart', (e) => { touchStartX = e.changedTouches[0].screenX; });
+document.addEventListener('touchend', (e) => {
+  const dx = e.changedTouches[0].screenX - touchStartX;
+  if (Math.abs(dx) > 50) { dx < 0 ? next() : prev(); }
+});
+
+// Init
+document.getElementById('progressBar').style.width = `${(1 / total) * 100}%`;
+</script>
+
+</body>
+</html>
